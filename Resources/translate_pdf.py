@@ -4,7 +4,7 @@ import math
 import os
 import re
 import sys
-from json import JSONDecodeError
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 
 ROOT = os.path.dirname(os.path.abspath(__file__))
@@ -12,48 +12,8 @@ PYTHON_DIR = os.path.join(ROOT, "python")
 if os.path.isdir(PYTHON_DIR):
     sys.path.insert(0, PYTHON_DIR)
 
-from llm_protocol import (  # noqa: E402
-    auth_headers,
-    chat_payload,
-    is_responses_endpoint,
-    request_json,
-    response_output_text,
-    responses_payload,
-)
-
-
-class Heuristics:
-    CJK_TARGET_NAMES = ("chinese", "中文", "zh", "cn")
-    AFFILIATION_TERMS = ("university", "institute", "school of", "department", "laboratory")
-    AUTHOR_PROSE_TERMS = {"the", "and", "for", "with", "from", "that", "this", "which", "into", "rather", "than"}
-    DOCUMENT_MARKER_PREFIXES = ("arxiv:", "doi:", "isbn:")
-    DOCUMENT_MARKER_PATTERN = re.compile(r"\d{4}|arxiv|cs\\.", re.IGNORECASE)
-    TOC_DOT_LEADER_PATTERN = re.compile(r"\.{2,}\s*\d+\s*$")
-    TOC_NUMBERED_ENTRY_PATTERN = re.compile(r"^\d+(?:\.\d+)*\s+\S.+\s+\d+\s*$")
-    FORMULA_WORDS = {"Softmax", "Sigmoid", "RMSNorm", "Topk", "CrossEntropy", "FFN", "TRM"}
-    MATH_CHARS = set("=<>≤≥±∓×÷∑∏√∫∞≈≠∈∉⊂⊃⊆⊇∪∩∂∇→←↔⇒⇔αβγδλμσπθΩ∆")
-    TECHNICAL_TERMS_FOR_SPACING = ("PP", "TP", "EP", "DP", "MTP", "Nc", "FP8", "BF16", "FP32")
-    GARBLED_QUESTION_MIN_COUNT = 4
-    GARBLED_QUESTION_RATIO = 0.12
-    MATH_FRAGMENT_MAX_LENGTH = 90
-    LAYOUT_FIT_ATTEMPTS = 6
-    LAYOUT_FONT_SHRINK = 0.9
-    LAYOUT_BOX_GROWTH = 24
-
-CJK_FONT_CANDIDATES = [
-    "/System/Library/Fonts/Supplemental/Arial Unicode.ttf",
-    "/System/Library/Fonts/STHeiti Medium.ttc",
-    "/System/Library/Fonts/STHeiti Light.ttc",
-    "/System/Library/Fonts/Hiragino Sans GB.ttc",
-    "/System/Library/Fonts/Supplemental/Songti.ttc",
-]
-CJK_FONT_FILE = next((path for path in CJK_FONT_CANDIDATES if os.path.exists(path)), None)
-CJK_BOLD_FONT_CANDIDATES = [
-    "/System/Library/Fonts/STHeiti Medium.ttc",
-    "/System/Library/Fonts/Supplemental/Arial Unicode.ttf",
-    "/System/Library/Fonts/Hiragino Sans GB.ttc",
-]
-CJK_BOLD_FONT_FILE = next((path for path in CJK_BOLD_FONT_CANDIDATES if os.path.exists(path)), CJK_FONT_FILE)
+from llm_translation import request_translation_json, request_translation_text  # noqa: E402
+from pdf_heuristics import CJK_BOLD_FONT_FILE, CJK_FONT_FILE, Heuristics  # noqa: E402
 
 try:
     import fitz
@@ -329,8 +289,8 @@ def translated_font_size(block, text=None):
 
 
 def should_protect_block(block):
-    if looks_like_toc_entry(block["text"]):
-        return False
+    if looks_like_toc_entry(block["text"]) and not block.get("translate_toc", Heuristics.TRANSLATE_TOC_DEFAULT):
+        return True
     if block.get("protected"):
         return True
     if looks_like_document_marker(block):
@@ -634,10 +594,6 @@ def merge_block_group(group):
 
 
 def translate_text(text, settings):
-    provider = settings["provider"]
-    endpoint = settings["endpoint"]
-    token = settings["token"]
-    model = settings["model"]
     target_language = settings.get("targetLanguage") or "Chinese"
     masked_text, math_replacements = protect_math_fragments(text)
 
@@ -649,44 +605,7 @@ def translate_text(text, settings):
         "Return only the translation."
     )
 
-    if provider == "claude":
-        payload = {
-            "model": model,
-            "max_tokens": 2048,
-            "temperature": 0.2,
-            "system": instructions,
-            "messages": [{"role": "user", "content": masked_text}],
-        }
-        result = request_json(endpoint, auth_headers(provider, endpoint, token), payload)
-        parts = result.get("content", [])
-        translated = "\n".join(item.get("text", "") for item in parts if item.get("type") == "text")
-        return restore_math_fragments(translated.strip(), math_replacements)
-
-    if is_responses_endpoint(endpoint):
-        payload = responses_payload(model, instructions, masked_text, 2048)
-        result = request_json(endpoint, auth_headers(provider, endpoint, token), payload)
-        translated = response_output_text(result)
-        if not translated:
-            raise RuntimeError("LLM response has no output text.")
-        return restore_math_fragments(translated, math_replacements)
-
-    payload = chat_payload(
-        endpoint,
-        model,
-        [
-            {
-                "role": "system",
-                "content": instructions,
-            },
-            {"role": "user", "content": masked_text},
-        ],
-        temperature=0.2,
-    )
-    result = request_json(endpoint, auth_headers(provider, endpoint, token), payload)
-    choices = result.get("choices", [])
-    if not choices:
-        raise RuntimeError("LLM response has no choices.")
-    translated = choices[0].get("message", {}).get("content", "").strip()
+    translated = request_translation_text(settings, instructions, masked_text, max_tokens=2048)
     return restore_math_fragments(translated, math_replacements)
 
 
@@ -695,6 +614,7 @@ def translate_page_blocks(blocks, settings, page_number):
     math_replacements_by_id = {}
     for index, block in enumerate(blocks, start=1):
         block["id"] = index
+        block["translate_toc"] = bool(settings.get("translateTOC", Heuristics.TRANSLATE_TOC_DEFAULT))
         block["protected"] = should_protect_block(block)
         if block["protected"]:
             continue
@@ -708,6 +628,17 @@ def translate_page_blocks(blocks, settings, page_number):
     try:
         translations = translate_blocks_as_page(translatable, settings, page_number)
         translations = restore_page_math_fragments(translations, math_replacements_by_id)
+        retry_ids = invalid_translation_ids(translatable, translations, settings)
+        if retry_ids:
+            emit_warning(page_number, f"Retrying untranslated or garbled block ids: {retry_ids}")
+            translations.update(
+                retry_translation_items(
+                    [item for item in translatable if item["id"] in retry_ids],
+                    settings,
+                    page_number,
+                    math_replacements_by_id,
+                )
+            )
         validate_translations(translatable, translations, settings)
         return translations
     except Exception as exc:
@@ -718,22 +649,42 @@ def translate_page_blocks(blocks, settings, page_number):
             ),
             flush=True,
         )
-        translations = {}
-        for item in translatable:
-            translated = normalize_translation_text(translate_text(item["text"], settings))
-            translated = restore_math_fragments(translated, math_replacements_by_id.get(item["id"], []))
-            if not translated.strip():
-                emit_warning(page_number, f"Block {item['id']} fallback returned empty text; original text kept.")
-                translated = item["text"]
-            elif looks_like_garbled_translation(translated, settings):
-                emit_warning(page_number, f"Block {item['id']} fallback returned garbled text; original text kept.")
-                translated = item["text"]
-            translations[item["id"]] = translated
+        translations = retry_translation_items(translatable, settings, page_number, math_replacements_by_id)
         try:
             validate_translations(translatable, translations, settings)
         except Exception as validation_error:
             emit_warning(page_number, str(validation_error))
         return translations
+
+
+def retry_translation_items(items, settings, page_number, math_replacements_by_id):
+    max_workers = int(settings.get("fallbackConcurrency", Heuristics.FALLBACK_CONCURRENCY))
+    max_workers = max(1, min(max_workers, len(items)))
+    translations = {}
+
+    def translate_item(item):
+        translated = normalize_translation_text(translate_text(item["text"], settings))
+        translated = restore_math_fragments(translated, math_replacements_by_id.get(item["id"], []))
+        if not translated.strip():
+            emit_warning(page_number, f"Block {item['id']} fallback returned empty text; original text kept.")
+            return item["id"], item["text"]
+        if looks_like_garbled_translation(translated, settings):
+            emit_warning(page_number, f"Block {item['id']} fallback returned garbled text; original text kept.")
+            return item["id"], item["text"]
+        return item["id"], translated
+
+    if max_workers == 1:
+        for item in items:
+            item_id, translated = translate_item(item)
+            translations[item_id] = translated
+        return translations
+
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        futures = [executor.submit(translate_item, item) for item in items]
+        for future in as_completed(futures):
+            item_id, translated = future.result()
+            translations[item_id] = translated
+    return translations
 
 
 def restore_page_math_fragments(translations, replacements_by_id):
@@ -754,8 +705,14 @@ def emit_warning(page_number, message):
 
 
 def validate_translations(items, translations, settings):
+    untranslated = invalid_translation_ids(items, translations, settings)
+    if untranslated:
+        raise RuntimeError(f"LLM returned untranslated prose ids: {untranslated}")
+
+
+def invalid_translation_ids(items, translations, settings):
     if not target_is_cjk(settings):
-        return
+        return []
 
     untranslated = []
     for item in items:
@@ -776,8 +733,7 @@ def validate_translations(items, translations, settings):
         if english_word_count(translated) >= max(6, english_word_count(source) * 0.45):
             untranslated.append(item["id"])
 
-    if untranslated:
-        raise RuntimeError(f"LLM returned untranslated prose ids: {untranslated}")
+    return untranslated
 
 
 def has_translatable_prose(blocks):
@@ -813,10 +769,6 @@ def looks_untranslated_for_target(source, translated, settings):
 
 
 def translate_blocks_as_page(items, settings, page_number):
-    provider = settings["provider"]
-    endpoint = settings["endpoint"]
-    token = settings["token"]
-    model = settings["model"]
     target_language = settings.get("targetLanguage") or "Chinese"
     source_json = json.dumps(items, ensure_ascii=False)
     prompt = (
@@ -836,48 +788,12 @@ def translate_blocks_as_page(items, settings, page_number):
         f"Page: {page_number}\nBlocks:\n{source_json}"
     )
 
-    if provider == "claude":
-        payload = {
-            "model": model,
-            "max_tokens": 8192,
-            "temperature": 0.2,
-            "system": "You are a precise PDF translation engine. Return only valid JSON.",
-            "messages": [{"role": "user", "content": prompt}],
-        }
-        result = request_json(endpoint, auth_headers(provider, endpoint, token), payload)
-        parts = result.get("content", [])
-        content = "\n".join(item.get("text", "") for item in parts if item.get("type") == "text")
-    elif is_responses_endpoint(endpoint):
-        payload = responses_payload(
-            model,
-            "You are a precise PDF translation engine. Return only valid JSON.",
-            prompt,
-            8192,
-        )
-        result = request_json(endpoint, auth_headers(provider, endpoint, token), payload)
-        content = response_output_text(result)
-        if not content:
-            raise RuntimeError("LLM response has no output text.")
-    else:
-        payload = chat_payload(
-            endpoint,
-            model,
-            [
-                {
-                    "role": "system",
-                    "content": "You are a precise PDF translation engine. Return only valid JSON.",
-                },
-                {"role": "user", "content": prompt},
-            ],
-            temperature=0.2,
-        )
-        result = request_json(endpoint, auth_headers(provider, endpoint, token), payload)
-        choices = result.get("choices", [])
-        if not choices:
-            raise RuntimeError("LLM response has no choices.")
-        content = choices[0].get("message", {}).get("content", "")
-
-    parsed = parse_translation_json(content)
+    parsed = request_translation_json(
+        settings,
+        "You are a precise PDF translation engine. Return only valid JSON.",
+        prompt,
+        max_tokens=8192,
+    )
     translations = {}
     expected_ids = {item["id"] for item in items}
     for item in parsed:
@@ -889,25 +805,6 @@ def translate_blocks_as_page(items, settings, page_number):
     if missing_ids:
         raise RuntimeError(f"LLM response missing ids: {sorted(missing_ids)}")
     return translations
-
-
-def parse_translation_json(content):
-    text = content.strip()
-    text = re.sub(r"^```(?:json)?\s*", "", text)
-    text = re.sub(r"\s*```$", "", text)
-    try:
-        parsed = json.loads(text)
-    except JSONDecodeError:
-        start = text.find("[")
-        end = text.rfind("]")
-        if start == -1 or end == -1 or end <= start:
-            raise
-        parsed = json.loads(text[start : end + 1])
-
-    if not isinstance(parsed, list):
-        raise RuntimeError("LLM response is not a JSON array.")
-    return parsed
-
 
 def text_width_units(text):
     units = 0.0
@@ -1023,9 +920,18 @@ def insert_translation_with_style(page, rect, font_size, text, bold=False):
     )
 
 
-def write_translation_page(out_doc, source_doc, page_index, blocks, settings):
+def append_source_page(out_doc, source_doc, page_index):
     out_doc.insert_pdf(source_doc, from_page=page_index, to_page=page_index)
-    page = out_doc[-1]
+
+
+def append_translation_page(out_doc, source_doc, page_index):
+    out_doc.insert_pdf(source_doc, from_page=page_index, to_page=page_index)
+    return out_doc[-1]
+
+
+def write_translation_page(out_doc, source_doc, page_index, blocks, settings):
+    append_source_page(out_doc, source_doc, page_index)
+    page = append_translation_page(out_doc, source_doc, page_index)
     translations = translate_page_blocks(blocks, settings, page_index + 1)
     inserted_texts = []
     for block in blocks:

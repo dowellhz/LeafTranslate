@@ -7,6 +7,7 @@ final class MainWindowController: NSWindowController, NSSplitViewDelegate, NSSea
 
     private let openButton = NSButton(title: "Open PDF", target: nil, action: nil)
     private let translateButton = NSButton(title: "Translate", target: nil, action: nil)
+    private let cancelButton = NSButton(title: "Cancel", target: nil, action: nil)
     private let exportButton = NSButton(title: "Export PDF", target: nil, action: nil)
     private let providerPopup = NSPopUpButton(frame: .zero, pullsDown: false)
     private let endpointField = ShortcutTextField(string: AppSettings.endpoint)
@@ -37,6 +38,7 @@ final class MainWindowController: NSWindowController, NSSplitViewDelegate, NSSea
     private var pageChangeObserver: NSObjectProtocol?
     private var searchSelections: [PDFSelection] = []
     private var searchSelectionIndex = 0
+    private let translationCoordinator = TranslationCoordinator()
     private var didSetInitialSidebarWidth = false
     private var sidebarCollapsed = false
     private var expandedSidebarWidth: CGFloat = 320
@@ -106,12 +108,15 @@ final class MainWindowController: NSWindowController, NSSplitViewDelegate, NSSea
         openButton.action = #selector(openPDF)
         translateButton.target = self
         translateButton.action = #selector(translatePDF)
+        cancelButton.target = self
+        cancelButton.action = #selector(cancelTranslation)
         exportButton.target = self
         exportButton.action = #selector(exportPDF)
         translateButton.isEnabled = false
+        cancelButton.isEnabled = false
         exportButton.isEnabled = false
 
-        for button in [openButton, translateButton, exportButton] {
+        for button in [openButton, translateButton, cancelButton, exportButton] {
             button.bezelStyle = .rounded
             button.controlSize = .large
             button.translatesAutoresizingMaskIntoConstraints = false
@@ -184,7 +189,7 @@ final class MainWindowController: NSWindowController, NSSplitViewDelegate, NSSea
         previewContainer.addSubview(previewToolbar)
         previewContainer.addSubview(pdfView)
         previewContainer.addSubview(bottomBar)
-        for view in [title, openButton, providerLabel, providerPopup, endpointLabel, endpointField, modelLabel, modelField, tokenLabel, tokenField, languageLabel, languageField, pageRangeLabel, pageRangeStack, translateButton, exportButton, statusLabel] {
+        for view in [title, openButton, providerLabel, providerPopup, endpointLabel, endpointField, modelLabel, modelField, tokenLabel, tokenField, languageLabel, languageField, pageRangeLabel, pageRangeStack, translateButton, cancelButton, exportButton, statusLabel] {
             sidebar.addSubview(view)
         }
 
@@ -273,7 +278,12 @@ final class MainWindowController: NSWindowController, NSSplitViewDelegate, NSSea
             translateButton.trailingAnchor.constraint(equalTo: title.trailingAnchor),
             translateButton.heightAnchor.constraint(equalToConstant: 40),
 
-            exportButton.topAnchor.constraint(equalTo: translateButton.bottomAnchor, constant: 10),
+            cancelButton.topAnchor.constraint(equalTo: translateButton.bottomAnchor, constant: 10),
+            cancelButton.leadingAnchor.constraint(equalTo: title.leadingAnchor),
+            cancelButton.trailingAnchor.constraint(equalTo: title.trailingAnchor),
+            cancelButton.heightAnchor.constraint(equalToConstant: 40),
+
+            exportButton.topAnchor.constraint(equalTo: cancelButton.bottomAnchor, constant: 10),
             exportButton.leadingAnchor.constraint(equalTo: title.leadingAnchor),
             exportButton.trailingAnchor.constraint(equalTo: title.trailingAnchor),
             exportButton.heightAnchor.constraint(equalToConstant: 40),
@@ -475,56 +485,53 @@ final class MainWindowController: NSWindowController, NSSplitViewDelegate, NSSea
             statusLabel.stringValue = "Unable to locate translate_pdf.py."
             return
         }
-        let settings: [String: Any] = [
-            "provider": selectedProvider.rawValue,
-            "endpoint": endpointField.stringValue.trimmingCharacters(in: .whitespacesAndNewlines),
-            "model": modelField.stringValue.trimmingCharacters(in: .whitespacesAndNewlines),
-            "token": token,
-            "targetLanguage": languageField.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
-        ]
+        let settings = TranslationSettings(
+            provider: selectedProvider,
+            endpoint: endpointField.stringValue.trimmingCharacters(in: .whitespacesAndNewlines),
+            model: modelField.stringValue.trimmingCharacters(in: .whitespacesAndNewlines),
+            token: token,
+            targetLanguage: languageField.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
+        )
 
         translateButton.isEnabled = false
+        cancelButton.isEnabled = true
         exportButton.isEnabled = false
         setPageRangeInputsEnabled(false)
         statusLabel.stringValue = "Generating translated PDF for pages \(pageRange.start)-\(pageRange.end)..."
 
-        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
-            do {
-                let outputURL = try self?.automaticOutputURL() ?? FileManager.default.temporaryDirectory
-                    .appendingPathComponent("translated")
-                    .appendingPathExtension("pdf")
-                if FileManager.default.fileExists(atPath: outputURL.path) {
-                    try FileManager.default.removeItem(at: outputURL)
-                }
-                try PDFTranslationRunner.run(
-                    inputURL: inputPDFURL,
-                    outputURL: outputURL,
-                    scriptURL: scriptURL,
-                    settings: settings,
-                    startPage: pageRange.start,
-                    pageLimit: pageRange.limit,
-                    progress: { [weak self] message in
-                        DispatchQueue.main.async {
-                            self?.statusLabel.stringValue = message
-                        }
-                    }
-                )
+        translationCoordinator.translate(
+            inputURL: inputPDFURL,
+            scriptURL: scriptURL,
+            settings: settings,
+            pageRange: pageRange,
+            progress: { [weak self] message in
                 DispatchQueue.main.async {
-                    self?.translatedPDFURL = outputURL
-                    self?.openPreviewPDF(outputURL)
-                    self?.statusLabel.stringValue = "Translation complete. Saved to \(outputURL.path)"
-                    self?.translateButton.isEnabled = true
-                    self?.exportButton.isEnabled = true
-                    self?.setPageRangeInputsEnabled(true)
-                }
-            } catch {
-                DispatchQueue.main.async {
-                    self?.statusLabel.stringValue = error.localizedDescription
-                    self?.translateButton.isEnabled = true
-                    self?.setPageRangeInputsEnabled(true)
+                    self?.statusLabel.stringValue = message
                 }
             }
+        ) { [weak self] result in
+            switch result {
+            case .success(let outputURL):
+                self?.translatedPDFURL = outputURL
+                self?.openPreviewPDF(outputURL)
+                self?.statusLabel.stringValue = "Translation complete. Saved to \(outputURL.path)"
+                self?.translateButton.isEnabled = true
+                self?.cancelButton.isEnabled = false
+                self?.exportButton.isEnabled = true
+                self?.setPageRangeInputsEnabled(true)
+            case .failure(let error):
+                self?.statusLabel.stringValue = error.localizedDescription
+                self?.translateButton.isEnabled = true
+                self?.cancelButton.isEnabled = false
+                self?.setPageRangeInputsEnabled(true)
+            }
         }
+    }
+
+    @objc private func cancelTranslation() {
+        translationCoordinator.cancel()
+        cancelButton.isEnabled = false
+        statusLabel.stringValue = "Cancelling translation..."
     }
 
     private func setPageRangeInputsEnabled(_ enabled: Bool) {
@@ -572,16 +579,6 @@ final class MainWindowController: NSWindowController, NSSplitViewDelegate, NSSea
             return url
         }
         return url.deletingPathExtension().appendingPathExtension("pdf")
-    }
-
-    private func automaticOutputURL() throws -> URL {
-        let downloads = try FileManager.default.url(
-            for: .downloadsDirectory,
-            in: .userDomainMask,
-            appropriateFor: nil,
-            create: true
-        )
-        return downloads.appendingPathComponent("translated").appendingPathExtension("pdf")
     }
 
     private func openPreviewPDF(_ url: URL) {

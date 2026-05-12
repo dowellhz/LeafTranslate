@@ -1,5 +1,37 @@
 import Foundation
 
+final class TranslationTask: @unchecked Sendable {
+    private let lock = NSLock()
+    private var process: Process?
+    private var cancelled = false
+
+    var isCancelled: Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return cancelled
+    }
+
+    func attach(_ process: Process) {
+        lock.lock()
+        defer { lock.unlock() }
+        self.process = process
+        if cancelled, process.isRunning {
+            process.terminate()
+        }
+    }
+
+    func cancel() {
+        lock.lock()
+        cancelled = true
+        let runningProcess = process
+        lock.unlock()
+
+        if runningProcess?.isRunning == true {
+            runningProcess?.terminate()
+        }
+    }
+}
+
 enum PDFTranslationRunner {
     static func run(
         inputURL: URL,
@@ -8,6 +40,7 @@ enum PDFTranslationRunner {
         settings: [String: Any],
         startPage: Int,
         pageLimit: Int,
+        task: TranslationTask,
         progress: @escaping (String) -> Void
     ) throws {
         let settingsURL = try writeTemporarySettings(settings)
@@ -33,6 +66,7 @@ enum PDFTranslationRunner {
         process.standardError = errorPipe
 
         let outputBuffer = ProcessOutputBuffer()
+        let errorBuffer = ProcessOutputBuffer()
         outputPipe.fileHandleForReading.readabilityHandler = { handle in
             let data = handle.availableData
             guard !data.isEmpty else {
@@ -48,16 +82,42 @@ enum PDFTranslationRunner {
                 }
             }
         }
+        errorPipe.fileHandleForReading.readabilityHandler = { handle in
+            let data = handle.availableData
+            guard !data.isEmpty else {
+                handle.readabilityHandler = nil
+                return
+            }
+
+            let chunk = String(data: data, encoding: .utf8) ?? ""
+            errorBuffer.append(chunk)
+            appendLog(chunk, to: logURL)
+        }
 
         try process.run()
+        task.attach(process)
+        while process.isRunning {
+            if task.isCancelled {
+                process.terminate()
+            }
+            Thread.sleep(forTimeInterval: 0.1)
+        }
         process.waitUntilExit()
         outputPipe.fileHandleForReading.readabilityHandler = nil
+        errorPipe.fileHandleForReading.readabilityHandler = nil
 
-        let stderr = String(data: errorPipe.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
+        let stderr = errorBuffer.text
         if !stderr.isEmpty {
             appendLog("\n[stderr]\n\(stderr)\n", to: logURL)
         }
         appendLog("=== Translation finished status \(process.terminationStatus) ===\n\n", to: logURL)
+        if task.isCancelled {
+            throw NSError(
+                domain: "LeafTranslate",
+                code: NSUserCancelledError,
+                userInfo: [NSLocalizedDescriptionKey: "Translation cancelled."]
+            )
+        }
         if process.terminationStatus != 0 {
             throw NSError(
                 domain: "LeafTranslate",
@@ -140,5 +200,11 @@ private final class ProcessOutputBuffer: @unchecked Sendable {
         var lines = pendingLine.components(separatedBy: .newlines)
         pendingLine = lines.popLast() ?? ""
         return lines
+    }
+
+    func append(_ chunk: String) {
+        lock.lock()
+        defer { lock.unlock() }
+        fullText += chunk
     }
 }
