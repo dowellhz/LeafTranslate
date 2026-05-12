@@ -1,5 +1,7 @@
 # LeafTranslate
 
+> Warning: This code has many bugs. Do not use it.
+
 A native macOS prototype for translating PDF files into bilingual documents.
 
 ## Stack
