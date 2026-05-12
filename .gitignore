@@ -1,0 +1,10 @@
+.DS_Store
+build/
+*.app/
+*.pkg
+*.dmg
+__pycache__/
+*.pyc
+*.pyo
+.swiftpm/
+DerivedData/
