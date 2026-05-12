@@ -610,6 +610,11 @@ def translate_text(text, settings):
 
 
 def translate_page_blocks(blocks, settings, page_number):
+    translatable, math_replacements_by_id = prepare_translatable_blocks(blocks, settings)
+    return translate_prepared_page(translatable, math_replacements_by_id, settings, page_number)
+
+
+def prepare_translatable_blocks(blocks, settings):
     translatable = []
     math_replacements_by_id = {}
     for index, block in enumerate(blocks, start=1):
@@ -621,7 +626,10 @@ def translate_page_blocks(blocks, settings, page_number):
         masked_text, math_replacements = protect_math_fragments(block["text"])
         math_replacements_by_id[index] = math_replacements
         translatable.append({"id": index, "text": masked_text})
+    return translatable, math_replacements_by_id
 
+
+def translate_prepared_page(translatable, math_replacements_by_id, settings, page_number):
     if not translatable:
         return {}
 
@@ -929,10 +937,9 @@ def append_translation_page(out_doc, source_doc, page_index):
     return out_doc[-1]
 
 
-def write_translation_page(out_doc, source_doc, page_index, blocks, settings):
+def write_translation_page(out_doc, source_doc, page_index, blocks, translations, settings):
     append_source_page(out_doc, source_doc, page_index)
     page = append_translation_page(out_doc, source_doc, page_index)
-    translations = translate_page_blocks(blocks, settings, page_index + 1)
     inserted_texts = []
     for block in blocks:
         if block.get("protected"):
@@ -961,18 +968,135 @@ def translate_pdf(input_path, output_path, settings, start_page, page_limit):
     out_doc = fitz.open()
     try:
         start_index, end_index = page_range(source_doc, start_page, page_limit)
-        for page_index in range(start_index, end_index):
-            translate_one_page(out_doc, source_doc, page_index, settings)
+        pages = extract_page_blocks(source_doc, start_index, end_index)
+        translations_by_page = translate_pages(pages, settings)
+        for page_index, blocks in pages:
+            write_translation_page(out_doc, source_doc, page_index, blocks, translations_by_page.get(page_index, {}), settings)
+            print(json.dumps({"page": page_index + 1, "status": "done"}, ensure_ascii=False), flush=True)
         out_doc.save(output_path, garbage=4, deflate=True)
     finally:
         out_doc.close()
         source_doc.close()
 
 
-def translate_one_page(out_doc, source_doc, page_index, settings):
-    source_page = source_doc[page_index]
-    write_translation_page(out_doc, source_doc, page_index, text_blocks(source_page), settings)
-    print(json.dumps({"page": page_index + 1, "status": "done"}, ensure_ascii=False), flush=True)
+def extract_page_blocks(source_doc, start_index, end_index):
+    pages = []
+    for page_index in range(start_index, end_index):
+        pages.append((page_index, text_blocks(source_doc[page_index])))
+    return pages
+
+
+def translate_pages(pages, settings):
+    max_workers = page_concurrency(settings, len(pages))
+    if max_workers == 1:
+        translations_by_page = {}
+        for page_index, blocks in pages:
+            translations, _ = translate_page_with_cache(page_index, blocks, settings)
+            translations_by_page[page_index] = translations
+        return translations_by_page
+
+    translations_by_page = {}
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        futures = {
+            executor.submit(translate_page_with_cache, page_index, blocks, settings): page_index
+            for page_index, blocks in pages
+        }
+        for future in as_completed(futures):
+            page_index = futures[future]
+            translations, used_cache = future.result()
+            translations_by_page[page_index] = translations
+            if not used_cache:
+                print(
+                    json.dumps(
+                        {"page": page_index + 1, "status": "translated"},
+                        ensure_ascii=False,
+                    ),
+                    flush=True,
+                )
+    return translations_by_page
+
+
+def translate_page_with_cache(page_index, blocks, settings):
+    page_number = page_index + 1
+    translatable, math_replacements_by_id = prepare_translatable_blocks(blocks, settings)
+    cached = load_cached_page_translations(settings, page_number, translatable)
+    if cached is not None:
+        print(
+            json.dumps(
+                {"page": page_number, "status": "cache"},
+                ensure_ascii=False,
+            ),
+            flush=True,
+        )
+        return cached, True
+
+    translations = translate_prepared_page(translatable, math_replacements_by_id, settings, page_number)
+    save_cached_page_translations(settings, page_number, translatable, translations)
+    return translations, False
+
+
+def load_cached_page_translations(settings, page_number, translatable):
+    path = page_cache_path(settings, page_number)
+    if not path or not os.path.exists(path):
+        return None
+    try:
+        with open(path, "r", encoding="utf-8") as file:
+            payload = json.load(file)
+        if payload.get("settingsSignature") != cache_settings_signature(settings):
+            return None
+        if payload.get("source") != translatable:
+            return None
+        translations = payload.get("translations", {})
+        normalized = {int(key): str(value) for key, value in translations.items()}
+        expected_ids = {item["id"] for item in translatable}
+        if expected_ids - set(normalized.keys()):
+            return None
+        return normalized
+    except Exception as exc:
+        emit_warning(page_number, f"Ignoring unreadable cache: {exc}")
+        return None
+
+
+def save_cached_page_translations(settings, page_number, translatable, translations):
+    path = page_cache_path(settings, page_number)
+    if not path:
+        return
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        payload = {
+            "page": page_number,
+            "settingsSignature": cache_settings_signature(settings),
+            "source": translatable,
+            "translations": {str(key): value for key, value in translations.items()},
+        }
+        temp_path = f"{path}.tmp"
+        with open(temp_path, "w", encoding="utf-8") as file:
+            json.dump(payload, file, ensure_ascii=False)
+        os.replace(temp_path, path)
+    except Exception as exc:
+        emit_warning(page_number, f"Failed to write cache: {exc}")
+
+
+def page_cache_path(settings, page_number):
+    cache_directory = settings.get("cacheDirectory")
+    if not cache_directory:
+        return None
+    return os.path.join(cache_directory, f"page-{page_number}.json")
+
+
+def cache_settings_signature(settings):
+    return {
+        "provider": settings.get("provider", ""),
+        "endpoint": settings.get("endpoint", ""),
+        "model": settings.get("model", ""),
+        "targetLanguage": settings.get("targetLanguage", "Chinese"),
+    }
+
+
+def page_concurrency(settings, page_count):
+    configured = int(settings.get("pageConcurrency", Heuristics.PAGE_CONCURRENCY))
+    capped = min(configured, Heuristics.PAGE_CONCURRENCY_LIMIT)
+    return max(1, min(capped, page_count))
 
 
 def page_range(doc, start_page, page_limit):

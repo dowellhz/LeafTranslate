@@ -169,6 +169,12 @@ enum PDFTranslationRunner {
         if status == "done" {
             return "Translated page \(page)."
         }
+        if status == "translated" {
+            return "Page \(page) translation received; writing PDF in page order..."
+        }
+        if status == "cache" {
+            return "Page \(page) loaded from cache."
+        }
         if status == "warning" {
             let message = payload["message"] as? String ?? "Translation warning."
             return "Warning page \(page): \(message)"

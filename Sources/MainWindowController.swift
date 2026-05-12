@@ -8,6 +8,7 @@ final class MainWindowController: NSWindowController, NSSplitViewDelegate, NSSea
     private let openButton = NSButton(title: "Open PDF", target: nil, action: nil)
     private let translateButton = NSButton(title: "Translate", target: nil, action: nil)
     private let cancelButton = NSButton(title: "Cancel", target: nil, action: nil)
+    private let clearCacheButton = NSButton(title: "Clear Cache", target: nil, action: nil)
     private let exportButton = NSButton(title: "Export PDF", target: nil, action: nil)
     private let providerPopup = NSPopUpButton(frame: .zero, pullsDown: false)
     private let endpointField = ShortcutTextField(string: AppSettings.endpoint)
@@ -35,6 +36,8 @@ final class MainWindowController: NSWindowController, NSSplitViewDelegate, NSSea
 
     private var inputPDFURL: URL?
     private var translatedPDFURL: URL?
+    private var currentBookHash: String?
+    private var currentCacheDirectory: URL?
     private var pageChangeObserver: NSObjectProtocol?
     private var searchSelections: [PDFSelection] = []
     private var searchSelectionIndex = 0
@@ -110,13 +113,16 @@ final class MainWindowController: NSWindowController, NSSplitViewDelegate, NSSea
         translateButton.action = #selector(translatePDF)
         cancelButton.target = self
         cancelButton.action = #selector(cancelTranslation)
+        clearCacheButton.target = self
+        clearCacheButton.action = #selector(clearCurrentBookCache)
         exportButton.target = self
         exportButton.action = #selector(exportPDF)
         translateButton.isEnabled = false
         cancelButton.isEnabled = false
+        clearCacheButton.isEnabled = false
         exportButton.isEnabled = false
 
-        for button in [openButton, translateButton, cancelButton, exportButton] {
+        for button in [openButton, translateButton, cancelButton, clearCacheButton, exportButton] {
             button.bezelStyle = .rounded
             button.controlSize = .large
             button.translatesAutoresizingMaskIntoConstraints = false
@@ -189,7 +195,7 @@ final class MainWindowController: NSWindowController, NSSplitViewDelegate, NSSea
         previewContainer.addSubview(previewToolbar)
         previewContainer.addSubview(pdfView)
         previewContainer.addSubview(bottomBar)
-        for view in [title, openButton, providerLabel, providerPopup, endpointLabel, endpointField, modelLabel, modelField, tokenLabel, tokenField, languageLabel, languageField, pageRangeLabel, pageRangeStack, translateButton, cancelButton, exportButton, statusLabel] {
+        for view in [title, openButton, providerLabel, providerPopup, endpointLabel, endpointField, modelLabel, modelField, tokenLabel, tokenField, languageLabel, languageField, pageRangeLabel, pageRangeStack, translateButton, cancelButton, clearCacheButton, exportButton, statusLabel] {
             sidebar.addSubview(view)
         }
 
@@ -283,7 +289,12 @@ final class MainWindowController: NSWindowController, NSSplitViewDelegate, NSSea
             cancelButton.trailingAnchor.constraint(equalTo: title.trailingAnchor),
             cancelButton.heightAnchor.constraint(equalToConstant: 40),
 
-            exportButton.topAnchor.constraint(equalTo: cancelButton.bottomAnchor, constant: 10),
+            clearCacheButton.topAnchor.constraint(equalTo: cancelButton.bottomAnchor, constant: 10),
+            clearCacheButton.leadingAnchor.constraint(equalTo: title.leadingAnchor),
+            clearCacheButton.trailingAnchor.constraint(equalTo: title.trailingAnchor),
+            clearCacheButton.heightAnchor.constraint(equalToConstant: 40),
+
+            exportButton.topAnchor.constraint(equalTo: clearCacheButton.bottomAnchor, constant: 10),
             exportButton.leadingAnchor.constraint(equalTo: title.leadingAnchor),
             exportButton.trailingAnchor.constraint(equalTo: title.trailingAnchor),
             exportButton.heightAnchor.constraint(equalToConstant: 40),
@@ -453,14 +464,26 @@ final class MainWindowController: NSWindowController, NSSplitViewDelegate, NSSea
             statusLabel.stringValue = "Unable to open PDF."
             return
         }
+        let bookHash: String
+        let cacheDirectory: URL
+        do {
+            bookHash = try BookCacheStore.bookHash(for: url)
+            cacheDirectory = try BookCacheStore.cacheDirectory(for: bookHash)
+        } catch {
+            statusLabel.stringValue = "Unable to prepare cache: \(error.localizedDescription)"
+            return
+        }
         inputPDFURL = url
         translatedPDFURL = nil
+        currentBookHash = bookHash
+        currentCacheDirectory = cacheDirectory
         pdfView.document = document
         pdfView.clearSelection()
         pdfView.autoScales = true
         updateReaderStatus()
         translateButton.isEnabled = true
         exportButton.isEnabled = false
+        updateClearCacheButton()
         setPageRangeInputsEnabled(true)
 
         let range = validatedPageRange(documentPageCount: document.pageCount, showError: false)
@@ -490,11 +513,13 @@ final class MainWindowController: NSWindowController, NSSplitViewDelegate, NSSea
             endpoint: endpointField.stringValue.trimmingCharacters(in: .whitespacesAndNewlines),
             model: modelField.stringValue.trimmingCharacters(in: .whitespacesAndNewlines),
             token: token,
-            targetLanguage: languageField.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
+            targetLanguage: languageField.stringValue.trimmingCharacters(in: .whitespacesAndNewlines),
+            cacheDirectory: currentCacheDirectory
         )
 
         translateButton.isEnabled = false
         cancelButton.isEnabled = true
+        clearCacheButton.isEnabled = false
         exportButton.isEnabled = false
         setPageRangeInputsEnabled(false)
         statusLabel.stringValue = "Generating translated PDF for pages \(pageRange.start)-\(pageRange.end)..."
@@ -518,11 +543,13 @@ final class MainWindowController: NSWindowController, NSSplitViewDelegate, NSSea
                 self?.translateButton.isEnabled = true
                 self?.cancelButton.isEnabled = false
                 self?.exportButton.isEnabled = true
+                self?.updateClearCacheButton()
                 self?.setPageRangeInputsEnabled(true)
             case .failure(let error):
                 self?.statusLabel.stringValue = error.localizedDescription
                 self?.translateButton.isEnabled = true
                 self?.cancelButton.isEnabled = false
+                self?.updateClearCacheButton()
                 self?.setPageRangeInputsEnabled(true)
             }
         }
@@ -532,6 +559,25 @@ final class MainWindowController: NSWindowController, NSSplitViewDelegate, NSSea
         translationCoordinator.cancel()
         cancelButton.isEnabled = false
         statusLabel.stringValue = "Cancelling translation..."
+    }
+
+    @objc private func clearCurrentBookCache() {
+        guard let currentBookHash else { return }
+        do {
+            try BookCacheStore.clearCache(for: currentBookHash)
+            updateClearCacheButton()
+            statusLabel.stringValue = "Cache cleared for this book."
+        } catch {
+            statusLabel.stringValue = error.localizedDescription
+        }
+    }
+
+    private func updateClearCacheButton() {
+        guard let currentCacheDirectory else {
+            clearCacheButton.isEnabled = false
+            return
+        }
+        clearCacheButton.isEnabled = BookCacheStore.hasCache(at: currentCacheDirectory)
     }
 
     private func setPageRangeInputsEnabled(_ enabled: Bool) {
