@@ -1,5 +1,9 @@
 # LeafTranslate
 
+<p align="center">
+  <img src="Resources/AppIconSource.png" alt="LeafTranslate icon" width="160">
+</p>
+
 LeafTranslate is a native macOS app for translating PDF documents with an OpenAI-compatible LLM API. It keeps the original PDF pages, creates translated pages, and exports a bilingual PDF or a translation-only PDF.
 
 ## Features
