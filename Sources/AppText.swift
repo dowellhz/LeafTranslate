@@ -9,7 +9,8 @@ enum AppText {
     static var translate: String { usesChinese ? "翻译" : "Translate" }
     static var cancel: String { usesChinese ? "取消" : "Cancel" }
     static var clearCache: String { usesChinese ? "清除缓存" : "Clear Cache" }
-    static var exportPDF: String { usesChinese ? "导出 PDF" : "Export PDF" }
+    static var exportBilingual: String { usesChinese ? "导出双语" : "Export Bilingual" }
+    static var exportTranslationOnly: String { usesChinese ? "导出仅翻译" : "Translation Only" }
     static var previousPage: String { usesChinese ? "‹  上一页" : "‹  Prev" }
     static var nextPage: String { usesChinese ? "下一页  ›" : "Next  ›" }
     static var search: String { usesChinese ? "搜索" : "Search" }
@@ -46,6 +47,14 @@ enum AppText {
 
     static func exported(_ path: String) -> String {
         usesChinese ? "已导出到 \(path)" : "Exported to \(path)"
+    }
+
+    static var unableToExportPDF: String {
+        usesChinese ? "无法导出 PDF。" : "Unable to export PDF."
+    }
+
+    static var noTranslationPages: String {
+        usesChinese ? "没有找到可导出的翻译页。" : "No translated pages found to export."
     }
 
     static var unableToOpenPDF: String { usesChinese ? "无法打开 PDF。" : "Unable to open PDF." }

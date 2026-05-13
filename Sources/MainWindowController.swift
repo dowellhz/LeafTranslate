@@ -8,7 +8,9 @@ final class MainWindowController: NSWindowController, NSSplitViewDelegate, NSSea
     private let translateButton = NSButton(title: AppText.translate, target: nil, action: nil)
     private let cancelButton = NSButton(title: AppText.cancel, target: nil, action: nil)
     private let clearCacheButton = NSButton(title: AppText.clearCache, target: nil, action: nil)
-    private let exportButton = NSButton(title: AppText.exportPDF, target: nil, action: nil)
+    private let exportButton = NSButton(title: AppText.exportBilingual, target: nil, action: nil)
+    private let exportTranslationOnlyButton = NSButton(title: AppText.exportTranslationOnly, target: nil, action: nil)
+    private let exportButtonStack = NSStackView()
     private let providerPopup = NSPopUpButton(frame: .zero, pullsDown: false)
     private let endpointLabel = NSTextField(labelWithString: AppText.endpoint)
     private let endpointField = ShortcutTextField(string: AppSettings.endpoint)
@@ -40,6 +42,7 @@ final class MainWindowController: NSWindowController, NSSplitViewDelegate, NSSea
     private let nextButton = NSButton(title: AppText.nextPage, target: nil, action: nil)
 
     private var inputPDFURL: URL?
+    private var inputPDFPageCount = 0
     private var translatedPDFURL: URL?
     private var currentBookHash: String?
     private var currentCacheDirectory: URL?
@@ -130,16 +133,32 @@ final class MainWindowController: NSWindowController, NSSplitViewDelegate, NSSea
         clearCacheButton.action = #selector(clearCurrentBookCache)
         exportButton.target = self
         exportButton.action = #selector(exportPDF)
+        exportTranslationOnlyButton.target = self
+        exportTranslationOnlyButton.action = #selector(exportTranslationOnlyPDF)
         translateButton.isEnabled = false
         cancelButton.isEnabled = false
         clearCacheButton.isEnabled = false
         exportButton.isEnabled = false
+        exportTranslationOnlyButton.isEnabled = false
 
-        for button in [openButton, translateButton, cancelButton, clearCacheButton, exportButton] {
+        for button in [openButton, translateButton, cancelButton, clearCacheButton] {
             button.bezelStyle = .rounded
             button.controlSize = .large
             button.translatesAutoresizingMaskIntoConstraints = false
         }
+        for button in [exportButton, exportTranslationOnlyButton] {
+            button.bezelStyle = .rounded
+            button.controlSize = .regular
+            button.font = NSFont.systemFont(ofSize: 12, weight: .medium)
+            button.translatesAutoresizingMaskIntoConstraints = false
+        }
+        exportButtonStack.orientation = .horizontal
+        exportButtonStack.alignment = .centerY
+        exportButtonStack.distribution = .fillEqually
+        exportButtonStack.spacing = 8
+        exportButtonStack.translatesAutoresizingMaskIntoConstraints = false
+        exportButtonStack.addArrangedSubview(exportButton)
+        exportButtonStack.addArrangedSubview(exportTranslationOnlyButton)
         configureCurrentFileView()
 
         configureFieldLabel(endpointLabel)
@@ -165,6 +184,8 @@ final class MainWindowController: NSWindowController, NSSplitViewDelegate, NSSea
             field.isSelectable = true
             field.translatesAutoresizingMaskIntoConstraints = false
         }
+        startPageField.delegate = self
+        endPageField.delegate = self
         languagePopup.translatesAutoresizingMaskIntoConstraints = false
         languagePopup.controlSize = .large
         for language in TargetLanguage.allCases {
@@ -216,7 +237,7 @@ final class MainWindowController: NSWindowController, NSSplitViewDelegate, NSSea
         previewContainer.addSubview(previewToolbar)
         previewContainer.addSubview(pdfView)
         previewContainer.addSubview(bottomBar)
-        for view in [title, openButton, currentFileView, providerLabel, providerPopup, endpointLabel, endpointField, modelLabel, modelField, tokenLabel, tokenField, languageLabel, languagePopup, pageRangeLabel, pageRangeStack, translateButton, cancelButton, clearCacheButton, exportButton, statusLabel] {
+        for view in [title, openButton, currentFileView, providerLabel, providerPopup, endpointLabel, endpointField, modelLabel, modelField, tokenLabel, tokenField, languageLabel, languagePopup, pageRangeLabel, pageRangeStack, translateButton, cancelButton, clearCacheButton, exportButtonStack, statusLabel] {
             sidebar.addSubview(view)
         }
 
@@ -335,12 +356,14 @@ final class MainWindowController: NSWindowController, NSSplitViewDelegate, NSSea
             clearCacheButton.trailingAnchor.constraint(equalTo: title.trailingAnchor),
             clearCacheButton.heightAnchor.constraint(equalToConstant: 40),
 
-            exportButton.topAnchor.constraint(equalTo: clearCacheButton.bottomAnchor, constant: 10),
-            exportButton.leadingAnchor.constraint(equalTo: title.leadingAnchor),
-            exportButton.trailingAnchor.constraint(equalTo: title.trailingAnchor),
-            exportButton.heightAnchor.constraint(equalToConstant: 40),
+            exportButtonStack.topAnchor.constraint(equalTo: clearCacheButton.bottomAnchor, constant: 10),
+            exportButtonStack.leadingAnchor.constraint(equalTo: title.leadingAnchor),
+            exportButtonStack.trailingAnchor.constraint(equalTo: title.trailingAnchor),
+            exportButtonStack.heightAnchor.constraint(equalToConstant: 32),
+            exportButton.heightAnchor.constraint(equalToConstant: 32),
+            exportTranslationOnlyButton.heightAnchor.constraint(equalToConstant: 32),
 
-            statusLabel.topAnchor.constraint(equalTo: exportButton.bottomAnchor, constant: 20),
+            statusLabel.topAnchor.constraint(equalTo: exportButtonStack.bottomAnchor, constant: 20),
             statusLabel.leadingAnchor.constraint(equalTo: title.leadingAnchor),
             statusLabel.trailingAnchor.constraint(equalTo: title.trailingAnchor)
         ])
@@ -558,6 +581,7 @@ final class MainWindowController: NSWindowController, NSSplitViewDelegate, NSSea
             return
         }
         inputPDFURL = url
+        inputPDFPageCount = document.pageCount
         translatedPDFURL = nil
         currentBookHash = bookHash
         currentCacheDirectory = cacheDirectory
@@ -571,6 +595,7 @@ final class MainWindowController: NSWindowController, NSSplitViewDelegate, NSSea
         updateReaderStatus()
         translateButton.isEnabled = true
         exportButton.isEnabled = false
+        exportTranslationOnlyButton.isEnabled = false
         updateClearCacheButton()
         setPageRangeInputsEnabled(true)
 
@@ -579,8 +604,7 @@ final class MainWindowController: NSWindowController, NSSplitViewDelegate, NSSea
 
     @objc private func translatePDF() {
         guard let inputPDFURL else { return }
-        let pageCount = pdfView.document?.pageCount ?? 0
-        guard let pageRange = validatedPageRange(documentPageCount: pageCount, showError: true) else {
+        guard let pageRange = validatedPageRange(documentPageCount: inputPDFPageCount, showError: true) else {
             return
         }
         let token = tokenField.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -603,10 +627,12 @@ final class MainWindowController: NSWindowController, NSSplitViewDelegate, NSSea
             cacheDirectory: currentCacheDirectory
         )
 
+        translatedPDFURL = nil
         translateButton.isEnabled = false
         cancelButton.isEnabled = true
         clearCacheButton.isEnabled = false
         exportButton.isEnabled = false
+        exportTranslationOnlyButton.isEnabled = false
         setPageRangeInputsEnabled(false)
         statusLabel.stringValue = AppText.generatingPages(start: pageRange.start, end: pageRange.end)
 
@@ -629,12 +655,15 @@ final class MainWindowController: NSWindowController, NSSplitViewDelegate, NSSea
                 self?.translateButton.isEnabled = true
                 self?.cancelButton.isEnabled = false
                 self?.exportButton.isEnabled = true
+                self?.exportTranslationOnlyButton.isEnabled = true
                 self?.updateClearCacheButton()
                 self?.setPageRangeInputsEnabled(true)
             case .failure(let error):
                 self?.statusLabel.stringValue = error.localizedDescription
                 self?.translateButton.isEnabled = true
                 self?.cancelButton.isEnabled = false
+                self?.exportButton.isEnabled = false
+                self?.exportTranslationOnlyButton.isEnabled = false
                 self?.updateClearCacheButton()
                 self?.setPageRangeInputsEnabled(true)
             }
@@ -691,7 +720,7 @@ final class MainWindowController: NSWindowController, NSSplitViewDelegate, NSSea
         guard let translatedPDFURL else { return }
         let panel = NSSavePanel()
         panel.allowedContentTypes = [.pdf]
-        panel.nameFieldStringValue = defaultExportFileName()
+        panel.nameFieldStringValue = defaultExportFileName(kind: .bilingual)
         panel.begin { [weak self] response in
             guard response == .OK, let url = panel.url else { return }
             do {
@@ -707,11 +736,72 @@ final class MainWindowController: NSWindowController, NSSplitViewDelegate, NSSea
         }
     }
 
-    private func defaultExportFileName() -> String {
+    @objc private func exportTranslationOnlyPDF() {
+        guard let translatedPDFURL else { return }
+        let panel = NSSavePanel()
+        panel.allowedContentTypes = [.pdf]
+        panel.nameFieldStringValue = defaultExportFileName(kind: .translationOnly)
+        panel.begin { [weak self] response in
+            guard response == .OK, let url = panel.url, let self else { return }
+            do {
+                let destinationURL = self.pdfURL(from: url)
+                if FileManager.default.fileExists(atPath: destinationURL.path) {
+                    try FileManager.default.removeItem(at: destinationURL)
+                }
+                try self.writeTranslationOnlyPDF(from: translatedPDFURL, to: destinationURL)
+                self.statusLabel.stringValue = AppText.exported(destinationURL.path)
+            } catch {
+                self.statusLabel.stringValue = error.localizedDescription
+            }
+        }
+    }
+
+    private enum ExportKind {
+        case bilingual
+        case translationOnly
+    }
+
+    private func defaultExportFileName(kind: ExportKind) -> String {
         let baseName = inputPDFURL?.deletingPathExtension().lastPathComponent
             .trimmingCharacters(in: .whitespacesAndNewlines)
         let sourceName = baseName?.isEmpty == false ? baseName! : "document"
-        return "\(sourceName)-\(selectedTargetLanguage.fileNameComponent)-translated.pdf"
+        switch kind {
+        case .bilingual:
+            return "\(sourceName)-\(selectedTargetLanguage.fileNameComponent)-translated.pdf"
+        case .translationOnly:
+            return "\(sourceName)-\(selectedTargetLanguage.fileNameComponent)-translation-only.pdf"
+        }
+    }
+
+    private func writeTranslationOnlyPDF(from sourceURL: URL, to destinationURL: URL) throws {
+        guard let scriptURL = Bundle.main.resourceURL?.appendingPathComponent("export_translation_only.py") else {
+            throw NSError(
+                domain: "LeafTranslate",
+                code: 1,
+                userInfo: [NSLocalizedDescriptionKey: AppText.missingTranslatorScript]
+            )
+        }
+
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/usr/bin/python3")
+        process.arguments = [scriptURL.path, sourceURL.path, destinationURL.path]
+        process.currentDirectoryURL = scriptURL.deletingLastPathComponent()
+
+        let errorPipe = Pipe()
+        process.standardError = errorPipe
+        try process.run()
+        process.waitUntilExit()
+
+        let stderrData = errorPipe.fileHandleForReading.readDataToEndOfFile()
+        let stderr = String(data: stderrData, encoding: .utf8)?
+            .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        if process.terminationStatus != 0 {
+            throw NSError(
+                domain: "LeafTranslate",
+                code: Int(process.terminationStatus),
+                userInfo: [NSLocalizedDescriptionKey: stderr.isEmpty ? AppText.unableToExportPDF : stderr]
+            )
+        }
     }
 
     private func saveSettings() {
@@ -822,6 +912,14 @@ final class MainWindowController: NSWindowController, NSSplitViewDelegate, NSSea
         zoomLabel.stringValue = "\(Int(round(pdfView.scaleFactor * 100)))%"
     }
 
+    func controlTextDidEndEditing(_ notification: Notification) {
+        guard let field = notification.object as? NSTextField,
+              field === startPageField || field === endPageField else {
+            return
+        }
+        normalizePageRangeInputs(documentPageCount: inputPDFPageCount)
+    }
+
     private func currentVisiblePageIndex(in document: PDFDocument) -> Int? {
         let visibleRect = pdfView.visibleRect
         let samplePoints = [
@@ -847,6 +945,7 @@ final class MainWindowController: NSWindowController, NSSplitViewDelegate, NSSea
     }
 
     private func validatedPageRange(documentPageCount: Int, showError: Bool) -> (start: Int, end: Int, limit: Int)? {
+        normalizePageRangeInputs(documentPageCount: documentPageCount)
         let start = Int(startPageField.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)) ?? 0
         let end = Int(endPageField.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)) ?? 0
 
@@ -871,6 +970,19 @@ final class MainWindowController: NSWindowController, NSSplitViewDelegate, NSSea
 
         let clampedEnd = documentPageCount > 0 ? min(end, documentPageCount) : end
         return (start, clampedEnd, clampedEnd - start + 1)
+    }
+
+    private func normalizePageRangeInputs(documentPageCount: Int) {
+        guard documentPageCount > 0 else { return }
+
+        let startText = startPageField.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
+        let endText = endPageField.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
+        if let start = Int(startText), start > documentPageCount {
+            startPageField.stringValue = "\(documentPageCount)"
+        }
+        if let end = Int(endText), end > documentPageCount {
+            endPageField.stringValue = "\(documentPageCount)"
+        }
     }
 
     private func fieldLabel(_ text: String) -> NSTextField {

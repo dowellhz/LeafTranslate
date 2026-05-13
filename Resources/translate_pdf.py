@@ -541,7 +541,83 @@ def text_blocks(page):
                 "protected": is_visual_label(text, rect, font_size, protected_regions),
             }
         )
+    mark_table_like_blocks(result, page.rect)
     return merge_drop_caps(result)
+
+
+def mark_table_like_blocks(blocks, page_rect):
+    candidates = []
+    for block in sorted(blocks, key=lambda item: (item["rect"].y0, item["rect"].x0)):
+        if compact_table_line_candidate(block):
+            candidates.append(block)
+
+    group = []
+    for block in candidates:
+        if not group:
+            group = [block]
+            continue
+
+        previous = group[-1]
+        vertical_gap = block["rect"].y0 - previous["rect"].y1
+        x0_drift = abs(block["rect"].x0 - previous["rect"].x0)
+        x1_drift = abs(block["rect"].x1 - previous["rect"].x1)
+        if vertical_gap <= 9 and x0_drift <= 48 and x1_drift <= 80:
+            group.append(block)
+        else:
+            protect_table_group(group, page_rect)
+            group = [block]
+    protect_table_group(group, page_rect)
+
+
+def compact_table_line_candidate(block):
+    rect = block["rect"]
+    text = normalize_text(block.get("text", ""))
+    if not text or block.get("protected"):
+        return False
+    if block["font_size"] > 10.8 or rect.height > 36:
+        return False
+    if rect.width < 80:
+        return False
+
+    words = re.findall(r"[A-Za-z]{2,}", text)
+    digit_count = sum(1 for char in text if char.isdigit())
+    table_terms = ("bleu", "flops", "model", "training cost", "en-de", "en-fr")
+    has_table_term = any(term in text.lower() for term in table_terms)
+    has_numeric_columns = digit_count >= 2 and bool(re.search(r"\b\d+(?:\.\d+)?\b.*\b\d+(?:\.\d+)?\b", text))
+    has_scientific_cost = bool(re.search(r"\d+(?:\.\d+)?\s*[·x×]\s*10", text))
+    return has_table_term or has_numeric_columns or has_scientific_cost or len(words) <= 10
+
+
+def protect_table_group(group, page_rect):
+    if len(group) < 4:
+        return
+
+    rect = fitz.Rect(group[0]["rect"])
+    for block in group[1:]:
+        rect |= block["rect"]
+
+    if rect.width > page_rect.width * 0.82:
+        return
+    if rect.height > page_rect.height * 0.35:
+        return
+
+    numeric_rows = sum(1 for block in group if sum(1 for char in block["text"] if char.isdigit()) >= 2)
+    table_terms = sum(
+        1
+        for block in group
+        if any(term in block["text"].lower() for term in ("bleu", "flops", "model", "en-de", "en-fr"))
+    )
+    if numeric_rows < 2 and table_terms < 2:
+        return
+
+    for index, block in enumerate(group):
+        if index == 0 and looks_like_table_caption(block.get("text", "")):
+            continue
+        block["protected"] = True
+
+
+def looks_like_table_caption(text):
+    return bool(re.match(r"^(?:Table|Figure)\s+\d+\s*[:.]", normalize_text(text), re.IGNORECASE))
 
 
 def span_is_bold(span):
@@ -821,12 +897,12 @@ def invalid_translation_ids(items, translations, settings):
     for item in items:
         source = item["text"]
         translated = translations.get(item["id"], "")
+        if not translated.strip():
+            untranslated.append(item["id"])
+            continue
         if english_word_count(source) < 8 and not contains_cjk_compatible_text(source):
             continue
         if looks_like_name_or_affiliation_block(source):
-            continue
-        if not translated.strip():
-            untranslated.append(item["id"])
             continue
         if looks_untranslated_for_target(source, translated, settings):
             untranslated.append(item["id"])
@@ -961,7 +1037,8 @@ def valid_text_rect(rect):
     return all(math.isfinite(value) for value in values) and rect.width >= 2 and rect.height >= 2
 
 
-def erase_original_text(page, block):
+def add_original_text_redactions(page, block):
+    added = False
     for erase_rect in block["erase_rects"]:
         safe_rect = fitz.Rect(erase_rect)
         if not valid_text_rect(safe_rect):
@@ -970,7 +1047,17 @@ def erase_original_text(page, block):
         safe_rect.x1 += 1.0
         safe_rect.y0 -= 0.5
         safe_rect.y1 += 0.5
-        page.draw_rect(safe_rect, color=None, fill=(1, 1, 1), overlay=True)
+        page.add_redact_annot(safe_rect, fill=(1, 1, 1), cross_out=False)
+        added = True
+    return added
+
+
+def apply_original_text_redactions(page):
+    page.apply_redactions(
+        images=fitz.PDF_REDACT_IMAGE_NONE,
+        graphics=fitz.PDF_REDACT_LINE_ART_NONE,
+        text=fitz.PDF_REDACT_TEXT_REMOVE,
+    )
 
 
 def translation_layout(page, block, text):
@@ -1029,17 +1116,110 @@ def insert_translation_with_style(page, rect, font_size, text, bold=False):
 
 
 def append_source_page(out_doc, source_doc, page_index):
-    out_doc.insert_pdf(source_doc, from_page=page_index, to_page=page_index)
+    out_doc.insert_pdf(source_doc, from_page=page_index, to_page=page_index, links=0)
 
 
 def append_translation_page(out_doc, source_doc, page_index):
-    out_doc.insert_pdf(source_doc, from_page=page_index, to_page=page_index)
+    out_doc.insert_pdf(source_doc, from_page=page_index, to_page=page_index, links=0)
     return out_doc[-1]
 
 
-def write_translation_page(out_doc, source_doc, page_index, blocks, translations, settings):
+def output_page_index(source_page_index, start_index, translated=False):
+    return (source_page_index - start_index) * 2 + (1 if translated else 0)
+
+
+def mapped_internal_link(link, start_index, end_index, translated=False):
+    target_page = link.get("page")
+    if target_page is None or target_page < start_index or target_page >= end_index:
+        return None
+    mapped = {
+        "kind": fitz.LINK_GOTO,
+        "from": link.get("from"),
+        "page": output_page_index(target_page, start_index, translated=translated),
+    }
+    if "to" in link:
+        mapped["to"] = link["to"]
+    if "zoom" in link:
+        mapped["zoom"] = link["zoom"]
+    return mapped
+
+
+def mapped_external_link(link):
+    mapped = dict(link)
+    mapped.pop("xref", None)
+    mapped.pop("id", None)
+    return mapped
+
+
+def copy_source_page_links(out_doc, source_doc, page_index, start_index, end_index):
+    out_page = out_doc[output_page_index(page_index, start_index, translated=False)]
+    for link in source_doc[page_index].get_links():
+        mapped = link_for_output(link, start_index, end_index, translated=False)
+        if mapped is not None:
+            out_page.insert_link(mapped)
+
+
+def copy_translation_page_links(out_doc, source_doc, page_index, start_index, end_index, insertion_map):
+    out_page = out_doc[output_page_index(page_index, start_index, translated=True)]
+    for link in source_doc[page_index].get_links():
+        mapped = link_for_output(link, start_index, end_index, translated=True)
+        if mapped is None:
+            continue
+        mapped["from"] = mapped_translation_link_rect(link.get("from"), insertion_map)
+        if valid_text_rect(fitz.Rect(mapped["from"])):
+            out_page.insert_link(mapped)
+
+
+def link_for_output(link, start_index, end_index, translated=False):
+    kind = link.get("kind")
+    if link.get("page") is not None:
+        return mapped_internal_link(link, start_index, end_index, translated=translated)
+    if kind in {fitz.LINK_URI, fitz.LINK_GOTOR, fitz.LINK_LAUNCH}:
+        return mapped_external_link(link)
+    return None
+
+
+def mapped_translation_link_rect(link_rect, insertion_map):
+    if not link_rect:
+        return link_rect
+    source_rect = fitz.Rect(link_rect)
+    best = None
+    best_score = 0
+    for source_block_rect, translated_rect in insertion_map:
+        overlap = rect_overlap_area(source_rect, source_block_rect)
+        if overlap > best_score:
+            best_score = overlap
+            best = translated_rect
+    if best is not None and best_score > 0:
+        return best
+    return source_rect
+
+
+def rect_overlap_area(first, second):
+    rect = fitz.Rect(first)
+    rect &= fitz.Rect(second)
+    if rect.is_empty:
+        return 0
+    return rect.width * rect.height
+
+
+def rebuild_output_links(out_doc, source_doc, page_indices, start_index, end_index, insertion_maps_by_page):
+    for page_index in page_indices:
+        copy_source_page_links(out_doc, source_doc, page_index, start_index, end_index)
+        copy_translation_page_links(
+            out_doc,
+            source_doc,
+            page_index,
+            start_index,
+            end_index,
+            insertion_maps_by_page.get(page_index, []),
+        )
+
+
+def write_translation_page(out_doc, source_doc, page_index, blocks, translations, settings, start_index, end_index):
     append_source_page(out_doc, source_doc, page_index)
     page = append_translation_page(out_doc, source_doc, page_index)
+    pending_insertions = []
     inserted_texts = []
     for block in blocks:
         if block.get("protected"):
@@ -1054,13 +1234,24 @@ def write_translation_page(out_doc, source_doc, page_index, blocks, translations
 
         rect, font_size = translation_layout(page, block, translated)
         if rect is not None:
-            erase_original_text(page, block)
-            insert_translation_with_style(page, rect, font_size, translated, bold=block.get("bold", False))
-            inserted_texts.append(translated)
+            pending_insertions.append((block, rect, font_size, translated))
         elif target_is_cjk(settings) and english_word_count(block.get("text", "")) >= 8:
             emit_warning(page_index + 1, f"Block {block['id']} translation did not fit; original text kept.")
+
+    has_redactions = False
+    for block, _, _, _ in pending_insertions:
+        has_redactions = add_original_text_redactions(page, block) or has_redactions
+    if has_redactions:
+        apply_original_text_redactions(page)
+
+    insertion_map = []
+    for block, rect, font_size, translated in pending_insertions:
+        insert_translation_with_style(page, rect, font_size, translated, bold=block.get("bold", False))
+        inserted_texts.append(translated)
+        insertion_map.append((fitz.Rect(block["rect"]), fitz.Rect(rect)))
+
     validate_written_page(blocks, inserted_texts, settings, page_index + 1)
-    return page
+    return insertion_map
 
 
 def translate_pdf(input_path, output_path, settings, start_page, page_limit):
@@ -1070,9 +1261,27 @@ def translate_pdf(input_path, output_path, settings, start_page, page_limit):
         start_index, end_index = page_range(source_doc, start_page, page_limit)
         pages = extract_page_blocks(source_doc, start_index, end_index)
         translations_by_page = translate_pages(pages, settings)
+        insertion_maps_by_page = {}
         for page_index, blocks in pages:
-            write_translation_page(out_doc, source_doc, page_index, blocks, translations_by_page.get(page_index, {}), settings)
+            insertion_maps_by_page[page_index] = write_translation_page(
+                out_doc,
+                source_doc,
+                page_index,
+                blocks,
+                translations_by_page.get(page_index, {}),
+                settings,
+                start_index,
+                end_index,
+            )
             print(json.dumps({"page": page_index + 1, "status": "done"}, ensure_ascii=False), flush=True)
+        rebuild_output_links(
+            out_doc,
+            source_doc,
+            [page_index for page_index, _ in pages],
+            start_index,
+            end_index,
+            insertion_maps_by_page,
+        )
         out_doc.save(output_path, garbage=4, deflate=True)
     finally:
         out_doc.close()
