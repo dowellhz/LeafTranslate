@@ -14,6 +14,10 @@ if os.path.isdir(PYTHON_DIR):
 
 from llm_translation import request_translation_json, request_translation_text  # noqa: E402
 from pdf_heuristics import CJK_BOLD_FONT_FILE, CJK_FONT_FILE, Heuristics  # noqa: E402
+try:
+    import opendataloader_adapter  # noqa: E402
+except Exception:
+    opendataloader_adapter = None
 
 try:
     import fitz
@@ -1259,7 +1263,7 @@ def translate_pdf(input_path, output_path, settings, start_page, page_limit):
     out_doc = fitz.open()
     try:
         start_index, end_index = page_range(source_doc, start_page, page_limit)
-        pages = extract_page_blocks(source_doc, start_index, end_index)
+        pages = extract_page_blocks(source_doc, input_path, start_index, end_index, settings)
         translations_by_page = translate_pages(pages, settings)
         insertion_maps_by_page = {}
         for page_index, blocks in pages:
@@ -1288,11 +1292,25 @@ def translate_pdf(input_path, output_path, settings, start_page, page_limit):
         source_doc.close()
 
 
-def extract_page_blocks(source_doc, start_index, end_index):
+def extract_page_blocks(source_doc, input_path, start_index, end_index, settings):
+    if should_use_opendataloader(settings):
+        try:
+            return opendataloader_adapter.extract_page_blocks(input_path, start_index, end_index)
+        except Exception as exc:
+            emit_warning(start_index + 1, f"OpenDataLoader extraction failed; using PyMuPDF extraction: {exc}")
+
     pages = []
     for page_index in range(start_index, end_index):
         pages.append((page_index, text_blocks(source_doc[page_index])))
     return pages
+
+
+def should_use_opendataloader(settings):
+    configured = str(settings.get("parserBackend", "")).strip().lower()
+    environment = os.environ.get("LEAFTRANSLATE_PARSER", "").strip().lower()
+    if configured == "pymupdf" or environment == "pymupdf":
+        return False
+    return opendataloader_adapter is not None
 
 
 def translate_pages(pages, settings):

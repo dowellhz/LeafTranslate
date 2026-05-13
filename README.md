@@ -78,6 +78,18 @@ open LeafTranslate.app
 
 The app bundles Python resources used for PDF translation and PyMuPDF-based export handling.
 
+## OpenDataLoader Branch
+
+The `OpenDataLoaderVersion` branch adds an optional OpenDataLoader extraction backend. In this branch LeafTranslate first tries OpenDataLoader for PDF structure extraction, then falls back to PyMuPDF extraction if OpenDataLoader, Python 3.10+, or Java 11+ is unavailable.
+
+PyMuPDF is still used for PDF writing, redaction, link rebuilding, and export because OpenDataLoader is a parser rather than a low-level PDF editing library.
+
+To force the older PyMuPDF extraction path while testing this branch:
+
+```bash
+LEAFTRANSLATE_PARSER=pymupdf open LeafTranslate.app
+```
+
 ## Release Package
 
 The macOS installer is built as a Developer ID signed package and submitted to Apple notarization.
