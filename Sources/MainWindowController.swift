@@ -2,22 +2,27 @@ import Cocoa
 import PDFKit
 
 final class MainWindowController: NSWindowController, NSSplitViewDelegate, NSSearchFieldDelegate {
-    private static let defaultStartPage = 10
-    private static let defaultEndPage = 19
+    private static let defaultStartPage = 1
 
-    private let openButton = NSButton(title: "Open PDF", target: nil, action: nil)
-    private let translateButton = NSButton(title: "Translate", target: nil, action: nil)
-    private let cancelButton = NSButton(title: "Cancel", target: nil, action: nil)
-    private let clearCacheButton = NSButton(title: "Clear Cache", target: nil, action: nil)
-    private let exportButton = NSButton(title: "Export PDF", target: nil, action: nil)
+    private let openButton = NSButton(title: AppText.openPDF, target: nil, action: nil)
+    private let translateButton = NSButton(title: AppText.translate, target: nil, action: nil)
+    private let cancelButton = NSButton(title: AppText.cancel, target: nil, action: nil)
+    private let clearCacheButton = NSButton(title: AppText.clearCache, target: nil, action: nil)
+    private let exportButton = NSButton(title: AppText.exportPDF, target: nil, action: nil)
     private let providerPopup = NSPopUpButton(frame: .zero, pullsDown: false)
+    private let endpointLabel = NSTextField(labelWithString: AppText.endpoint)
     private let endpointField = ShortcutTextField(string: AppSettings.endpoint)
+    private let modelLabel = NSTextField(labelWithString: AppText.model)
     private let modelField = ShortcutTextField(string: AppSettings.model)
+    private let tokenLabel = NSTextField(labelWithString: AppText.token)
     private let tokenField = ShortcutSecureTextField(string: AppSettings.token)
-    private let languageField = ShortcutTextField(string: AppSettings.targetLanguage)
+    private let languagePopup = NSPopUpButton(frame: .zero, pullsDown: false)
     private let startPageField = ShortcutTextField(string: "\(MainWindowController.defaultStartPage)")
-    private let endPageField = ShortcutTextField(string: "\(MainWindowController.defaultEndPage)")
-    private let statusLabel = NSTextField(labelWithString: "Open a PDF to begin.")
+    private let endPageField = ShortcutTextField(string: "\(MainWindowController.defaultStartPage)")
+    private let currentFileView = NSView()
+    private let currentFileThumbnail = NSImageView()
+    private let currentFileNameLabel = NSTextField(labelWithString: "")
+    private let statusLabel = NSTextField(labelWithString: AppText.initialStatus)
     private let splitView = NSSplitView()
     private let sidebarShell = NSView()
     private let sidebar = NSView()
@@ -31,20 +36,24 @@ final class MainWindowController: NSWindowController, NSSplitViewDelegate, NSSea
     private let zoomLabel = NSTextField(labelWithString: "100%")
     private let pageLabel = NSTextField(labelWithString: "- / -")
     private let searchField = NSSearchField()
-    private let previousButton = NSButton(title: "‹  Prev", target: nil, action: nil)
-    private let nextButton = NSButton(title: "Next  ›", target: nil, action: nil)
+    private let previousButton = NSButton(title: AppText.previousPage, target: nil, action: nil)
+    private let nextButton = NSButton(title: AppText.nextPage, target: nil, action: nil)
 
     private var inputPDFURL: URL?
     private var translatedPDFURL: URL?
     private var currentBookHash: String?
     private var currentCacheDirectory: URL?
     private var pageChangeObserver: NSObjectProtocol?
+    private var scrollObserver: NSObjectProtocol?
     private var searchSelections: [PDFSelection] = []
     private var searchSelectionIndex = 0
     private let translationCoordinator = TranslationCoordinator()
     private var didSetInitialSidebarWidth = false
     private var sidebarCollapsed = false
     private var expandedSidebarWidth: CGFloat = 320
+    private var tokenAfterModelConstraint: NSLayoutConstraint?
+    private var tokenAfterProviderConstraint: NSLayoutConstraint?
+    private var currentFileHeightConstraint: NSLayoutConstraint?
 
     init() {
         let window = NSWindow(
@@ -54,6 +63,7 @@ final class MainWindowController: NSWindowController, NSSplitViewDelegate, NSSea
             defer: false
         )
         window.title = "LeafTranslate"
+        window.appearance = NSAppearance(named: .aqua)
         window.center()
         super.init(window: window)
         buildUI()
@@ -66,6 +76,9 @@ final class MainWindowController: NSWindowController, NSSplitViewDelegate, NSSea
     deinit {
         if let pageChangeObserver {
             NotificationCenter.default.removeObserver(pageChangeObserver)
+        }
+        if let scrollObserver {
+            NotificationCenter.default.removeObserver(scrollObserver)
         }
     }
 
@@ -127,15 +140,16 @@ final class MainWindowController: NSWindowController, NSSplitViewDelegate, NSSea
             button.controlSize = .large
             button.translatesAutoresizingMaskIntoConstraints = false
         }
+        configureCurrentFileView()
 
-        let endpointLabel = fieldLabel("LLM / Azure URL")
-        let providerLabel = fieldLabel("Provider")
-        let modelLabel = fieldLabel("Model / Azure deployment")
-        let tokenLabel = fieldLabel("Token")
-        let languageLabel = fieldLabel("Target language")
-        let pageRangeLabel = fieldLabel("Pages")
+        configureFieldLabel(endpointLabel)
+        let providerLabel = fieldLabel(AppText.provider)
+        configureFieldLabel(modelLabel)
+        configureFieldLabel(tokenLabel)
+        let languageLabel = fieldLabel(AppText.targetLanguage)
+        let pageRangeLabel = fieldLabel(AppText.pages)
         let pageRangeStack = NSStackView()
-        let pageRangeSeparator = NSTextField(labelWithString: "to")
+        let pageRangeSeparator = NSTextField(labelWithString: AppText.to)
         providerPopup.translatesAutoresizingMaskIntoConstraints = false
         providerPopup.controlSize = .large
         for provider in LLMProvider.allCases {
@@ -146,11 +160,18 @@ final class MainWindowController: NSWindowController, NSSplitViewDelegate, NSSea
         providerPopup.target = self
         providerPopup.action = #selector(providerChanged(_:))
 
-        for field in [endpointField, modelField, tokenField, languageField, startPageField, endPageField] {
+        for field in [endpointField, modelField, tokenField, startPageField, endPageField] {
             field.isEditable = true
             field.isSelectable = true
             field.translatesAutoresizingMaskIntoConstraints = false
         }
+        languagePopup.translatesAutoresizingMaskIntoConstraints = false
+        languagePopup.controlSize = .large
+        for language in TargetLanguage.allCases {
+            languagePopup.addItem(withTitle: language.displayName)
+            languagePopup.lastItem?.representedObject = language.rawValue
+        }
+        languagePopup.selectItem(withTitle: TargetLanguage.normalized(AppSettings.targetLanguage).displayName)
         startPageField.alignment = .center
         endPageField.alignment = .center
 
@@ -195,9 +216,14 @@ final class MainWindowController: NSWindowController, NSSplitViewDelegate, NSSea
         previewContainer.addSubview(previewToolbar)
         previewContainer.addSubview(pdfView)
         previewContainer.addSubview(bottomBar)
-        for view in [title, openButton, providerLabel, providerPopup, endpointLabel, endpointField, modelLabel, modelField, tokenLabel, tokenField, languageLabel, languageField, pageRangeLabel, pageRangeStack, translateButton, cancelButton, clearCacheButton, exportButton, statusLabel] {
+        for view in [title, openButton, currentFileView, providerLabel, providerPopup, endpointLabel, endpointField, modelLabel, modelField, tokenLabel, tokenField, languageLabel, languagePopup, pageRangeLabel, pageRangeStack, translateButton, cancelButton, clearCacheButton, exportButton, statusLabel] {
             sidebar.addSubview(view)
         }
+
+        tokenAfterModelConstraint = tokenLabel.topAnchor.constraint(equalTo: modelField.bottomAnchor, constant: 18)
+        tokenAfterProviderConstraint = tokenLabel.topAnchor.constraint(equalTo: providerPopup.bottomAnchor, constant: 18)
+        tokenAfterProviderConstraint?.isActive = false
+        currentFileHeightConstraint = currentFileView.heightAnchor.constraint(equalToConstant: 0)
 
         NSLayoutConstraint.activate([
             splitView.leadingAnchor.constraint(equalTo: contentView.leadingAnchor),
@@ -239,7 +265,21 @@ final class MainWindowController: NSWindowController, NSSplitViewDelegate, NSSea
             openButton.trailingAnchor.constraint(equalTo: title.trailingAnchor),
             openButton.heightAnchor.constraint(equalToConstant: 40),
 
-            providerLabel.topAnchor.constraint(equalTo: openButton.bottomAnchor, constant: 24),
+            currentFileView.topAnchor.constraint(equalTo: openButton.bottomAnchor, constant: 10),
+            currentFileView.leadingAnchor.constraint(equalTo: title.leadingAnchor),
+            currentFileView.trailingAnchor.constraint(equalTo: title.trailingAnchor),
+            currentFileHeightConstraint!,
+
+            currentFileThumbnail.leadingAnchor.constraint(equalTo: currentFileView.leadingAnchor),
+            currentFileThumbnail.centerYAnchor.constraint(equalTo: currentFileView.centerYAnchor),
+            currentFileThumbnail.widthAnchor.constraint(equalToConstant: 38),
+            currentFileThumbnail.heightAnchor.constraint(equalToConstant: 52),
+
+            currentFileNameLabel.leadingAnchor.constraint(equalTo: currentFileThumbnail.trailingAnchor, constant: 10),
+            currentFileNameLabel.trailingAnchor.constraint(equalTo: currentFileView.trailingAnchor),
+            currentFileNameLabel.centerYAnchor.constraint(equalTo: currentFileView.centerYAnchor),
+
+            providerLabel.topAnchor.constraint(equalTo: currentFileView.bottomAnchor, constant: 18),
             providerLabel.leadingAnchor.constraint(equalTo: title.leadingAnchor),
             providerPopup.topAnchor.constraint(equalTo: providerLabel.bottomAnchor, constant: 8),
             providerPopup.leadingAnchor.constraint(equalTo: title.leadingAnchor),
@@ -258,7 +298,7 @@ final class MainWindowController: NSWindowController, NSSplitViewDelegate, NSSea
             modelField.leadingAnchor.constraint(equalTo: title.leadingAnchor),
             modelField.trailingAnchor.constraint(equalTo: title.trailingAnchor),
 
-            tokenLabel.topAnchor.constraint(equalTo: modelField.bottomAnchor, constant: 18),
+            tokenAfterModelConstraint!,
             tokenLabel.leadingAnchor.constraint(equalTo: title.leadingAnchor),
             tokenField.topAnchor.constraint(equalTo: tokenLabel.bottomAnchor, constant: 8),
             tokenField.leadingAnchor.constraint(equalTo: title.leadingAnchor),
@@ -266,11 +306,12 @@ final class MainWindowController: NSWindowController, NSSplitViewDelegate, NSSea
 
             languageLabel.topAnchor.constraint(equalTo: tokenField.bottomAnchor, constant: 18),
             languageLabel.leadingAnchor.constraint(equalTo: title.leadingAnchor),
-            languageField.topAnchor.constraint(equalTo: languageLabel.bottomAnchor, constant: 8),
-            languageField.leadingAnchor.constraint(equalTo: title.leadingAnchor),
-            languageField.trailingAnchor.constraint(equalTo: title.trailingAnchor),
+            languagePopup.topAnchor.constraint(equalTo: languageLabel.bottomAnchor, constant: 8),
+            languagePopup.leadingAnchor.constraint(equalTo: title.leadingAnchor),
+            languagePopup.trailingAnchor.constraint(equalTo: title.trailingAnchor),
+            languagePopup.heightAnchor.constraint(equalToConstant: 36),
 
-            pageRangeLabel.topAnchor.constraint(equalTo: languageField.bottomAnchor, constant: 18),
+            pageRangeLabel.topAnchor.constraint(equalTo: languagePopup.bottomAnchor, constant: 18),
             pageRangeLabel.leadingAnchor.constraint(equalTo: title.leadingAnchor),
             pageRangeStack.topAnchor.constraint(equalTo: pageRangeLabel.bottomAnchor, constant: 8),
             pageRangeStack.leadingAnchor.constraint(equalTo: title.leadingAnchor),
@@ -303,6 +344,7 @@ final class MainWindowController: NSWindowController, NSSplitViewDelegate, NSSea
             statusLabel.leadingAnchor.constraint(equalTo: title.leadingAnchor),
             statusLabel.trailingAnchor.constraint(equalTo: title.trailingAnchor)
         ])
+        updateProviderFieldsVisibility()
         installPageObserver()
     }
 
@@ -366,7 +408,7 @@ final class MainWindowController: NSWindowController, NSSplitViewDelegate, NSSea
         pageLabel.alignment = .center
         pageLabel.translatesAutoresizingMaskIntoConstraints = false
 
-        searchField.placeholderString = "Search"
+        searchField.placeholderString = AppText.search
         searchField.target = self
         searchField.action = #selector(searchChanged)
         searchField.delegate = self
@@ -413,6 +455,28 @@ final class MainWindowController: NSWindowController, NSSplitViewDelegate, NSSea
         ])
     }
 
+    private func configureCurrentFileView() {
+        currentFileView.translatesAutoresizingMaskIntoConstraints = false
+        currentFileView.isHidden = true
+
+        currentFileThumbnail.translatesAutoresizingMaskIntoConstraints = false
+        currentFileThumbnail.imageScaling = .scaleProportionallyUpOrDown
+        currentFileThumbnail.wantsLayer = true
+        currentFileThumbnail.layer?.cornerRadius = 4
+        currentFileThumbnail.layer?.borderWidth = 1
+        currentFileThumbnail.layer?.borderColor = NSColor(red: 0.82, green: 0.86, blue: 0.91, alpha: 1).cgColor
+        currentFileThumbnail.layer?.backgroundColor = NSColor.white.cgColor
+
+        currentFileNameLabel.translatesAutoresizingMaskIntoConstraints = false
+        currentFileNameLabel.font = NSFont.systemFont(ofSize: 13, weight: .medium)
+        currentFileNameLabel.textColor = NSColor(red: 0.15, green: 0.18, blue: 0.24, alpha: 1)
+        currentFileNameLabel.lineBreakMode = .byTruncatingMiddle
+        currentFileNameLabel.maximumNumberOfLines = 2
+
+        currentFileView.addSubview(currentFileThumbnail)
+        currentFileView.addSubview(currentFileNameLabel)
+    }
+
     @objc private func providerChanged(_ sender: NSPopUpButton) {
         guard let rawValue = sender.selectedItem?.representedObject as? String,
               let provider = LLMProvider(rawValue: rawValue) else {
@@ -420,6 +484,7 @@ final class MainWindowController: NSWindowController, NSSplitViewDelegate, NSSea
         }
         endpointField.stringValue = provider.defaultEndpoint
         modelField.stringValue = provider.defaultModel
+        updateProviderFieldsVisibility()
         saveSettings()
     }
 
@@ -447,6 +512,25 @@ final class MainWindowController: NSWindowController, NSSplitViewDelegate, NSSea
         ) { [weak self] _ in
             self?.updateReaderStatus()
         }
+        installScrollObserver()
+    }
+
+    private func installScrollObserver() {
+        if let scrollObserver {
+            NotificationCenter.default.removeObserver(scrollObserver)
+            self.scrollObserver = nil
+        }
+        guard let contentView = pdfView.documentView?.enclosingScrollView?.contentView else {
+            return
+        }
+        contentView.postsBoundsChangedNotifications = true
+        scrollObserver = NotificationCenter.default.addObserver(
+            forName: NSView.boundsDidChangeNotification,
+            object: contentView,
+            queue: .main
+        ) { [weak self] _ in
+            self?.updateReaderStatus()
+        }
     }
 
     @objc private func openPDF() {
@@ -461,7 +545,7 @@ final class MainWindowController: NSWindowController, NSSplitViewDelegate, NSSea
 
     private func loadPDF(_ url: URL) {
         guard let document = PDFDocument(url: url) else {
-            statusLabel.stringValue = "Unable to open PDF."
+            statusLabel.stringValue = AppText.unableToOpenPDF
             return
         }
         let bookHash: String
@@ -470,25 +554,27 @@ final class MainWindowController: NSWindowController, NSSplitViewDelegate, NSSea
             bookHash = try BookCacheStore.bookHash(for: url)
             cacheDirectory = try BookCacheStore.cacheDirectory(for: bookHash)
         } catch {
-            statusLabel.stringValue = "Unable to prepare cache: \(error.localizedDescription)"
+            statusLabel.stringValue = AppText.unableToPrepareCache(error.localizedDescription)
             return
         }
         inputPDFURL = url
         translatedPDFURL = nil
         currentBookHash = bookHash
         currentCacheDirectory = cacheDirectory
+        updateCurrentFileView(url: url, document: document)
         pdfView.document = document
         pdfView.clearSelection()
         pdfView.autoScales = true
+        startPageField.stringValue = "\(Self.defaultStartPage)"
+        endPageField.stringValue = "\(document.pageCount)"
+        installScrollObserver()
         updateReaderStatus()
         translateButton.isEnabled = true
         exportButton.isEnabled = false
         updateClearCacheButton()
         setPageRangeInputsEnabled(true)
 
-        let range = validatedPageRange(documentPageCount: document.pageCount, showError: false)
-        let rangeText = range.map { "\($0.start)-\($0.end)" } ?? "\(Self.defaultStartPage)-\(min(document.pageCount, Self.defaultEndPage))"
-        statusLabel.stringValue = "Loaded \(document.pageCount) pages. No parsing yet. Translation will process pages \(rangeText)."
+        statusLabel.stringValue = AppText.loadedPages(document.pageCount)
     }
 
     @objc private func translatePDF() {
@@ -499,13 +585,13 @@ final class MainWindowController: NSWindowController, NSSplitViewDelegate, NSSea
         }
         let token = tokenField.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !token.isEmpty else {
-            statusLabel.stringValue = "Token is empty."
+            statusLabel.stringValue = AppText.tokenEmpty
             return
         }
 
         saveSettings()
         guard let scriptURL = Bundle.main.resourceURL?.appendingPathComponent("translate_pdf.py") else {
-            statusLabel.stringValue = "Unable to locate translate_pdf.py."
+            statusLabel.stringValue = AppText.missingTranslatorScript
             return
         }
         let settings = TranslationSettings(
@@ -513,7 +599,7 @@ final class MainWindowController: NSWindowController, NSSplitViewDelegate, NSSea
             endpoint: endpointField.stringValue.trimmingCharacters(in: .whitespacesAndNewlines),
             model: modelField.stringValue.trimmingCharacters(in: .whitespacesAndNewlines),
             token: token,
-            targetLanguage: languageField.stringValue.trimmingCharacters(in: .whitespacesAndNewlines),
+            targetLanguage: selectedTargetLanguage.rawValue,
             cacheDirectory: currentCacheDirectory
         )
 
@@ -522,7 +608,7 @@ final class MainWindowController: NSWindowController, NSSplitViewDelegate, NSSea
         clearCacheButton.isEnabled = false
         exportButton.isEnabled = false
         setPageRangeInputsEnabled(false)
-        statusLabel.stringValue = "Generating translated PDF for pages \(pageRange.start)-\(pageRange.end)..."
+        statusLabel.stringValue = AppText.generatingPages(start: pageRange.start, end: pageRange.end)
 
         translationCoordinator.translate(
             inputURL: inputPDFURL,
@@ -539,7 +625,7 @@ final class MainWindowController: NSWindowController, NSSplitViewDelegate, NSSea
             case .success(let outputURL):
                 self?.translatedPDFURL = outputURL
                 self?.openPreviewPDF(outputURL)
-                self?.statusLabel.stringValue = "Translation complete. Saved to \(outputURL.path)"
+                self?.statusLabel.stringValue = AppText.translationComplete(outputURL.path)
                 self?.translateButton.isEnabled = true
                 self?.cancelButton.isEnabled = false
                 self?.exportButton.isEnabled = true
@@ -558,15 +644,15 @@ final class MainWindowController: NSWindowController, NSSplitViewDelegate, NSSea
     @objc private func cancelTranslation() {
         translationCoordinator.cancel()
         cancelButton.isEnabled = false
-        statusLabel.stringValue = "Cancelling translation..."
+        statusLabel.stringValue = AppText.cancellingTranslation
     }
 
     @objc private func clearCurrentBookCache() {
         guard let currentBookHash else { return }
         do {
-            try BookCacheStore.clearCache(for: currentBookHash)
+            let removedCount = try BookCacheStore.clearCache(for: currentBookHash)
             updateClearCacheButton()
-            statusLabel.stringValue = "Cache cleared for this book."
+            statusLabel.stringValue = AppText.cacheCleared(removedCount)
         } catch {
             statusLabel.stringValue = error.localizedDescription
         }
@@ -578,6 +664,17 @@ final class MainWindowController: NSWindowController, NSSplitViewDelegate, NSSea
             return
         }
         clearCacheButton.isEnabled = BookCacheStore.hasCache(at: currentCacheDirectory)
+    }
+
+    private func updateCurrentFileView(url: URL, document: PDFDocument) {
+        currentFileNameLabel.stringValue = url.lastPathComponent
+        if let firstPage = document.page(at: 0) {
+            currentFileThumbnail.image = firstPage.thumbnail(of: NSSize(width: 76, height: 104), for: .mediaBox)
+        } else {
+            currentFileThumbnail.image = NSImage(named: NSImage.multipleDocumentsName)
+        }
+        currentFileView.isHidden = false
+        currentFileHeightConstraint?.constant = 60
     }
 
     private func setPageRangeInputsEnabled(_ enabled: Bool) {
@@ -594,7 +691,7 @@ final class MainWindowController: NSWindowController, NSSplitViewDelegate, NSSea
         guard let translatedPDFURL else { return }
         let panel = NSSavePanel()
         panel.allowedContentTypes = [.pdf]
-        panel.nameFieldStringValue = "translated.pdf"
+        panel.nameFieldStringValue = defaultExportFileName()
         panel.begin { [weak self] response in
             guard response == .OK, let url = panel.url else { return }
             do {
@@ -603,11 +700,18 @@ final class MainWindowController: NSWindowController, NSSplitViewDelegate, NSSea
                     try FileManager.default.removeItem(at: destinationURL)
                 }
                 try FileManager.default.copyItem(at: translatedPDFURL, to: destinationURL)
-                self?.statusLabel.stringValue = "Exported to \(destinationURL.path)"
+                self?.statusLabel.stringValue = AppText.exported(destinationURL.path)
             } catch {
                 self?.statusLabel.stringValue = error.localizedDescription
             }
         }
+    }
+
+    private func defaultExportFileName() -> String {
+        let baseName = inputPDFURL?.deletingPathExtension().lastPathComponent
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        let sourceName = baseName?.isEmpty == false ? baseName! : "document"
+        return "\(sourceName)-\(selectedTargetLanguage.fileNameComponent)-translated.pdf"
     }
 
     private func saveSettings() {
@@ -616,7 +720,7 @@ final class MainWindowController: NSWindowController, NSSplitViewDelegate, NSSea
             endpoint: endpointField.stringValue,
             model: modelField.stringValue,
             token: tokenField.stringValue,
-            targetLanguage: languageField.stringValue
+            targetLanguage: selectedTargetLanguage.rawValue
         )
     }
 
@@ -633,6 +737,7 @@ final class MainWindowController: NSWindowController, NSSplitViewDelegate, NSSea
         pdfView.displayDirection = .vertical
         pdfView.clearSelection()
         pdfView.autoScales = true
+        installScrollObserver()
         searchSelections.removeAll()
         searchSelectionIndex = 0
         searchField.stringValue = ""
@@ -652,12 +757,22 @@ final class MainWindowController: NSWindowController, NSSplitViewDelegate, NSSea
     }
 
     @objc private func previousPage() {
-        pdfView.goToPreviousPage(nil)
+        guard let document = pdfView.document else { return }
+        let currentIndex = currentVisiblePageIndex(in: document) ?? 0
+        let targetIndex = max(0, currentIndex - 1)
+        if let page = document.page(at: targetIndex) {
+            pdfView.go(to: page)
+        }
         updateReaderStatus()
     }
 
     @objc private func nextPage() {
-        pdfView.goToNextPage(nil)
+        guard let document = pdfView.document else { return }
+        let currentIndex = currentVisiblePageIndex(in: document) ?? 0
+        let targetIndex = min(document.pageCount - 1, currentIndex + 1)
+        if let page = document.page(at: targetIndex) {
+            pdfView.go(to: page)
+        }
         updateReaderStatus()
     }
 
@@ -698,13 +813,37 @@ final class MainWindowController: NSWindowController, NSSplitViewDelegate, NSSea
     }
 
     private func updateReaderStatus() {
-        if let document = pdfView.document, let page = pdfView.currentPage {
-            let index = document.index(for: page) + 1
+        if let document = pdfView.document {
+            let index = (currentVisiblePageIndex(in: document) ?? 0) + 1
             pageLabel.stringValue = "\(index) / \(document.pageCount)"
         } else {
             pageLabel.stringValue = "- / -"
         }
         zoomLabel.stringValue = "\(Int(round(pdfView.scaleFactor * 100)))%"
+    }
+
+    private func currentVisiblePageIndex(in document: PDFDocument) -> Int? {
+        let visibleRect = pdfView.visibleRect
+        let samplePoints = [
+            CGPoint(x: visibleRect.midX, y: visibleRect.midY),
+            CGPoint(x: visibleRect.midX, y: visibleRect.minY + visibleRect.height * 0.35),
+            CGPoint(x: visibleRect.midX, y: visibleRect.minY + visibleRect.height * 0.65),
+            CGPoint(x: visibleRect.minX + visibleRect.width * 0.35, y: visibleRect.midY),
+            CGPoint(x: visibleRect.minX + visibleRect.width * 0.65, y: visibleRect.midY)
+        ]
+
+        for point in samplePoints {
+            if let page = pdfView.page(for: point, nearest: false) {
+                return document.index(for: page)
+            }
+        }
+        if let page = pdfView.page(for: CGPoint(x: visibleRect.midX, y: visibleRect.midY), nearest: true) {
+            return document.index(for: page)
+        }
+        if let page = pdfView.currentPage {
+            return document.index(for: page)
+        }
+        return nil
     }
 
     private func validatedPageRange(documentPageCount: Int, showError: Bool) -> (start: Int, end: Int, limit: Int)? {
@@ -713,19 +852,19 @@ final class MainWindowController: NSWindowController, NSSplitViewDelegate, NSSea
 
         guard start > 0, end > 0 else {
             if showError {
-                statusLabel.stringValue = "Page range must use positive numbers."
+                statusLabel.stringValue = AppText.positivePageRange
             }
             return nil
         }
         guard start <= end else {
             if showError {
-                statusLabel.stringValue = "Start page must be less than or equal to end page."
+                statusLabel.stringValue = AppText.startBeforeEnd
             }
             return nil
         }
         guard documentPageCount == 0 || start <= documentPageCount else {
             if showError {
-                statusLabel.stringValue = "Start page is outside the PDF."
+                statusLabel.stringValue = AppText.startOutsidePDF
             }
             return nil
         }
@@ -736,10 +875,23 @@ final class MainWindowController: NSWindowController, NSSplitViewDelegate, NSSea
 
     private func fieldLabel(_ text: String) -> NSTextField {
         let label = NSTextField(labelWithString: text)
+        configureFieldLabel(label)
+        return label
+    }
+
+    private func configureFieldLabel(_ label: NSTextField) {
         label.font = NSFont.systemFont(ofSize: 13, weight: .semibold)
         label.textColor = NSColor(red: 0.30, green: 0.35, blue: 0.42, alpha: 1)
         label.translatesAutoresizingMaskIntoConstraints = false
-        return label
+    }
+
+    private func updateProviderFieldsVisibility() {
+        let isCustomProvider = selectedProvider == .custom
+        for view in [endpointLabel, endpointField, modelLabel, modelField] {
+            view.isHidden = !isCustomProvider
+        }
+        tokenAfterModelConstraint?.isActive = isCustomProvider
+        tokenAfterProviderConstraint?.isActive = !isCustomProvider
     }
 
     private var selectedProvider: LLMProvider {
@@ -748,5 +900,12 @@ final class MainWindowController: NSWindowController, NSSplitViewDelegate, NSSea
             return .custom
         }
         return provider
+    }
+
+    private var selectedTargetLanguage: TargetLanguage {
+        guard let rawValue = languagePopup.selectedItem?.representedObject as? String else {
+            return .chinese
+        }
+        return TargetLanguage.normalized(rawValue)
     }
 }

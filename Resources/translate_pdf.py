@@ -210,13 +210,82 @@ def contains_cjk(text):
     return any("\u3400" <= char <= "\u9fff" for char in text)
 
 
+def cjk_char_count(text):
+    return sum(1 for char in text if "\u3400" <= char <= "\u9fff")
+
+
+def cjk_prose_char_count(text):
+    return sum(1 for char in text if "\u4e00" <= char <= "\u9fff")
+
+
+def contains_kana(text):
+    return any("\u3040" <= char <= "\u30ff" for char in text)
+
+
+def contains_hangul(text):
+    return any("\uac00" <= char <= "\ud7af" for char in text)
+
+
+def contains_cjk_compatible_text(text):
+    return contains_cjk(text) or contains_kana(text) or contains_hangul(text)
+
+
 def target_is_cjk(settings):
-    target_language = (settings.get("targetLanguage") or "").lower()
-    return any(name in target_language for name in Heuristics.CJK_TARGET_NAMES)
+    target_language = normalized_target_language(settings).lower()
+    return target_language in {"chinese", "japanese", "korean"}
+
+
+def target_is_latin_language(settings):
+    target_language = normalized_target_language(settings).lower()
+    return target_language in {"english", "spanish", "french"}
+
+
+def contains_target_language_script(text, settings):
+    target_language = normalized_target_language(settings).lower()
+    if target_language == "japanese":
+        return contains_kana(text)
+    if target_language == "korean":
+        return contains_hangul(text)
+    if target_language == "chinese":
+        return contains_cjk(text) and not contains_kana(text) and not contains_hangul(text)
+    if target_language in {"english", "spanish", "french"}:
+        return bool(re.search(r"[A-Za-zÀ-ÖØ-öø-ÿ]{3,}", text))
+    return True
+
+
+def normalized_target_language(settings):
+    target_language = normalize_text(settings.get("targetLanguage") or "Chinese")
+    aliases = {
+        "中文": "Chinese",
+        "简体中文": "Chinese",
+        "chinese": "Chinese",
+        "zh": "Chinese",
+        "cn": "Chinese",
+        "英文": "English",
+        "english": "English",
+        "en": "English",
+        "西班牙语": "Spanish",
+        "spanish": "Spanish",
+        "es": "Spanish",
+        "法语": "French",
+        "french": "French",
+        "fr": "French",
+        "日语": "Japanese",
+        "japanese": "Japanese",
+        "ja": "Japanese",
+        "韩语": "Korean",
+        "korean": "Korean",
+        "ko": "Korean",
+    }
+    return aliases.get(target_language.lower(), aliases.get(target_language, target_language or "Chinese"))
 
 
 def english_word_count(text):
     return len(re.findall(r"[A-Za-z]{3,}", text))
+
+
+def normalized_for_language_compare(text):
+    return re.sub(r"\s+", " ", normalize_text(text)).strip().lower()
 
 
 def looks_like_toc_entry(text):
@@ -258,7 +327,7 @@ def cjk_ratio(text):
 
 
 def font_options_for_text(text, bold=False):
-    if contains_cjk(text) and cjk_ratio(text) >= 0.18:
+    if contains_cjk_compatible_text(text) and (contains_kana(text) or contains_hangul(text) or cjk_ratio(text) >= 0.18):
         font_file = CJK_BOLD_FONT_FILE if bold else CJK_FONT_FILE
         if font_file:
             return {"fontname": "cjk-bold" if bold else "cjk-mixed", "fontfile": font_file}
@@ -271,7 +340,7 @@ def translated_font_size(block, text=None):
     text = text or block.get("translation", "") or block.get("text", "")
     if block.get("title"):
         return max(17, min(22, source_size * 0.98))
-    if contains_cjk(text):
+    if contains_cjk_compatible_text(text):
         if source_size >= 18:
             return min(19, source_size * 0.90)
         if source_size >= 14:
@@ -297,6 +366,8 @@ def should_protect_block(block):
         return True
     if looks_like_name_or_affiliation_block(block["text"]):
         return True
+    if cjk_prose_char_count(block["text"]) >= Heuristics.CJK_PROSE_PROTECT_BYPASS_CHARS:
+        return False
     return looks_like_formula_or_math(block["text"]) or looks_like_chart_or_icon_text(block)
 
 
@@ -525,7 +596,7 @@ def merge_drop_caps(blocks):
             consumed.add(body_index)
 
         group = [block] + [blocks[body_index] for body_index in body_indexes]
-        merged.append(merge_block_group(group))
+        merged.append(merge_drop_cap_group(group))
 
     return sorted(merged, key=lambda item: (item["rect"].y0, item["rect"].x0))
 
@@ -536,7 +607,7 @@ def drop_cap_body_indexes(candidate, blocks, candidate_index, consumed):
         return []
 
     rect = candidate["rect"]
-    if rect.height < max(24, candidate["font_size"] * 1.8):
+    if rect.height < max(24, candidate["font_size"] * 0.95):
         return []
 
     nearby = []
@@ -555,7 +626,10 @@ def drop_cap_body_indexes(candidate, blocks, candidate_index, consumed):
             continue
         if block["font_size"] >= candidate["font_size"] * 0.85:
             continue
-        if not block["text"].strip():
+        body_text = block["text"].strip()
+        if not body_text:
+            continue
+        if not re.match(r"^[a-z]", body_text):
             continue
 
         vertical_overlap = min(rect.y1, other.y1) - max(rect.y0, other.y0)
@@ -565,6 +639,30 @@ def drop_cap_body_indexes(candidate, blocks, candidate_index, consumed):
 
     nearby.sort(key=lambda item: (blocks[item]["rect"].y0, blocks[item]["rect"].x0))
     return nearby[:2]
+
+
+def merge_drop_cap_group(group):
+    drop_cap = group[0]
+    body_blocks = sorted(group[1:], key=lambda item: (item["rect"].y0, item["rect"].x0))
+    rect = fitz.Rect(drop_cap["rect"])
+    for block in body_blocks:
+        rect |= block["rect"]
+
+    first_body_text = body_blocks[0]["text"] if body_blocks else ""
+    remaining_texts = [block["text"] for block in body_blocks[1:]]
+    text_parts = [f"{drop_cap['text'].strip()}{first_body_text.strip()}"] + remaining_texts
+    font_sizes = [block["font_size"] for block in body_blocks] or [drop_cap["font_size"]]
+    bold_count = sum(1 for block in body_blocks if block.get("bold", False))
+
+    return {
+        "text": normalize_text(" ".join(text_parts)),
+        "rect": rect,
+        "erase_rects": [erase_rect for block in group for erase_rect in block["erase_rects"]],
+        "font_size": sum(font_sizes) / len(font_sizes),
+        "bold": bold_count >= max(1, len(body_blocks) // 2) if body_blocks else False,
+        "title": any(block.get("title", False) for block in body_blocks),
+        "protected": any(block.get("protected", False) for block in body_blocks),
+    }
 
 
 def merge_block_group(group):
@@ -594,7 +692,7 @@ def merge_block_group(group):
 
 
 def translate_text(text, settings):
-    target_language = settings.get("targetLanguage") or "Chinese"
+    target_language = normalized_target_language(settings)
     masked_text, math_replacements = protect_math_fragments(text)
 
     instructions = (
@@ -719,26 +817,18 @@ def validate_translations(items, translations, settings):
 
 
 def invalid_translation_ids(items, translations, settings):
-    if not target_is_cjk(settings):
-        return []
-
     untranslated = []
     for item in items:
         source = item["text"]
         translated = translations.get(item["id"], "")
-        if english_word_count(source) < 8:
+        if english_word_count(source) < 8 and not contains_cjk_compatible_text(source):
             continue
         if looks_like_name_or_affiliation_block(source):
             continue
         if not translated.strip():
             untranslated.append(item["id"])
             continue
-        if looks_like_garbled_translation(translated, settings):
-            untranslated.append(item["id"])
-            continue
-        if contains_cjk(translated):
-            continue
-        if english_word_count(translated) >= max(6, english_word_count(source) * 0.45):
+        if looks_untranslated_for_target(source, translated, settings):
             untranslated.append(item["id"])
 
     return untranslated
@@ -757,27 +847,37 @@ def validate_written_page(blocks, inserted_texts, settings, page_number):
     if not target_is_cjk(settings) or not has_translatable_prose(blocks):
         return True
 
-    if any(contains_cjk(text) for text in inserted_texts):
+    if any(contains_target_language_script(text, settings) for text in inserted_texts):
         return True
 
-    emit_warning(page_number, f"Page {page_number} has prose but no Chinese translation was written.")
+    emit_warning(page_number, f"Page {page_number} has prose but no {normalized_target_language(settings)} translation was written.")
     return False
 
 
 def looks_untranslated_for_target(source, translated, settings):
-    if not target_is_cjk(settings):
-        return False
     if looks_like_garbled_translation(translated, settings):
         return True
-    if english_word_count(source) < 8:
-        return False
-    if looks_like_name_or_affiliation_block(source):
-        return False
-    return not contains_cjk(translated)
+    if target_is_cjk(settings):
+        if english_word_count(source) < 8:
+            return False
+        if looks_like_name_or_affiliation_block(source):
+            return False
+        return not contains_target_language_script(translated, settings)
+    if target_is_latin_language(settings):
+        target_language = normalized_target_language(settings).lower()
+        if not contains_target_language_script(translated, settings):
+            return True
+        if contains_cjk_compatible_text(source):
+            translated_cjk = cjk_char_count(translated)
+            translated_words = english_word_count(translated)
+            return translated_cjk >= 2 and translated_cjk > translated_words * 2
+        if target_language in {"spanish", "french"} and english_word_count(source) >= 8:
+            return normalized_for_language_compare(source) == normalized_for_language_compare(translated)
+    return False
 
 
 def translate_blocks_as_page(items, settings, page_number):
-    target_language = settings.get("targetLanguage") or "Chinese"
+    target_language = normalized_target_language(settings)
     source_json = json.dumps(items, ensure_ascii=False)
     prompt = (
         f"Translate the following PDF page text blocks into {target_language}.\n"
@@ -1031,7 +1131,11 @@ def translate_page_with_cache(page_index, blocks, settings):
         return cached, True
 
     translations = translate_prepared_page(translatable, math_replacements_by_id, settings, page_number)
-    save_cached_page_translations(settings, page_number, translatable, translations)
+    invalid_ids = invalid_translation_ids(translatable, translations, settings)
+    if invalid_ids:
+        emit_warning(page_number, f"Page not cached because translated ids do not match target language: {invalid_ids}")
+    else:
+        save_cached_page_translations(settings, page_number, translatable, translations)
     return translations, False
 
 
@@ -1050,6 +1154,8 @@ def load_cached_page_translations(settings, page_number, translatable):
         normalized = {int(key): str(value) for key, value in translations.items()}
         expected_ids = {item["id"] for item in translatable}
         if expected_ids - set(normalized.keys()):
+            return None
+        if invalid_translation_ids(translatable, normalized, settings):
             return None
         return normalized
     except Exception as exc:
@@ -1081,16 +1187,22 @@ def page_cache_path(settings, page_number):
     cache_directory = settings.get("cacheDirectory")
     if not cache_directory:
         return None
-    return os.path.join(cache_directory, f"page-{page_number}.json")
+    return os.path.join(cache_directory, cache_language_key(settings), f"page-{page_number}.json")
 
 
 def cache_settings_signature(settings):
     return {
+        "version": 2,
         "provider": settings.get("provider", ""),
         "endpoint": settings.get("endpoint", ""),
         "model": settings.get("model", ""),
-        "targetLanguage": settings.get("targetLanguage", "Chinese"),
+        "targetLanguage": normalized_target_language(settings),
     }
+
+
+def cache_language_key(settings):
+    target_language = normalized_target_language(settings).lower()
+    return re.sub(r"[^a-z0-9_-]+", "-", target_language).strip("-") or "language"
 
 
 def page_concurrency(settings, page_count):

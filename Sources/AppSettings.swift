@@ -35,7 +35,7 @@ enum AppSettings {
     }
 
     static var targetLanguage: String {
-        get { UserDefaults.standard.string(forKey: targetLanguageKey) ?? "Chinese" }
+        get { TargetLanguage.normalized(UserDefaults.standard.string(forKey: targetLanguageKey) ?? "").rawValue }
         set { UserDefaults.standard.set(newValue, forKey: targetLanguageKey) }
     }
 

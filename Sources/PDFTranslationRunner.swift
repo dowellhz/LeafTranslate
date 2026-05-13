@@ -167,20 +167,20 @@ enum PDFTranslationRunner {
             return nil
         }
         if status == "done" {
-            return "Translated page \(page)."
+            return AppText.translatedPage(page)
         }
         if status == "translated" {
-            return "Page \(page) translation received; writing PDF in page order..."
+            return AppText.pageTranslationReceived(page)
         }
         if status == "cache" {
-            return "Page \(page) loaded from cache."
+            return AppText.pageLoadedFromCache(page)
         }
         if status == "warning" {
             let message = payload["message"] as? String ?? "Translation warning."
-            return "Warning page \(page): \(message)"
+            return AppText.warningPage(page, message: message)
         }
         if status == "fallback" {
-            return "Page \(page) needs smaller chunks; retrying automatically..."
+            return AppText.pageFallback(page)
         }
         return nil
     }

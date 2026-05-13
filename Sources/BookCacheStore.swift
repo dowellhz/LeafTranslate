@@ -23,20 +23,30 @@ enum BookCacheStore {
     }
 
     static func hasCache(at directory: URL) -> Bool {
-        guard let contents = try? FileManager.default.contentsOfDirectory(
+        cacheFileCount(at: directory) > 0
+    }
+
+    static func cacheFileCount(at directory: URL) -> Int {
+        guard let enumerator = FileManager.default.enumerator(
             at: directory,
             includingPropertiesForKeys: nil
         ) else {
-            return false
+            return 0
         }
-        return contents.contains { $0.pathExtension.lowercased() == "json" }
+        return enumerator.reduce(0) { count, item in
+            guard let url = item as? URL else { return count }
+            return count + (url.pathExtension.lowercased() == "json" ? 1 : 0)
+        }
     }
 
-    static func clearCache(for bookHash: String) throws {
+    @discardableResult
+    static func clearCache(for bookHash: String) throws -> Int {
         let directory = try cacheDirectory(for: bookHash)
+        let removedCount = cacheFileCount(at: directory)
         if FileManager.default.fileExists(atPath: directory.path) {
             try FileManager.default.removeItem(at: directory)
         }
+        return removedCount
     }
 
     private static func cacheRootDirectory() throws -> URL {

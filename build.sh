@@ -3,7 +3,7 @@ set -euo pipefail
 
 APP_NAME="LeafTranslate"
 BUNDLE_ID="com.linlu.leaftranslate"
-VERSION="0.1.0"
+VERSION="1.0.0"
 MACOS_TARGET="arm64-apple-macos12.0"
 ROOT_DIR="$(cd "$(dirname "$0")" && pwd)"
 BUILD_DIR="$ROOT_DIR/build"
