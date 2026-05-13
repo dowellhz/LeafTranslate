@@ -783,7 +783,8 @@ final class MainWindowController: NSWindowController, NSSplitViewDelegate, NSSea
         }
 
         let process = Process()
-        process.executableURL = URL(fileURLWithPath: "/usr/bin/python3")
+        process.executableURL = PDFTranslationRunner.pythonExecutableURL
+        process.environment = PDFTranslationRunner.pythonEnvironment
         process.arguments = [scriptURL.path, sourceURL.path, destinationURL.path]
         process.currentDirectoryURL = scriptURL.deletingLastPathComponent()
 

@@ -33,6 +33,28 @@ final class TranslationTask: @unchecked Sendable {
 }
 
 enum PDFTranslationRunner {
+    static var pythonExecutableURL: URL {
+        let candidates = [
+            "/Users/linlu/.leaftranslate-opendataloader-venv/bin/python",
+            "/opt/homebrew/bin/python3.12",
+            "/usr/bin/python3"
+        ]
+        for path in candidates where FileManager.default.isExecutableFile(atPath: path) {
+            return URL(fileURLWithPath: path)
+        }
+        return URL(fileURLWithPath: "/usr/bin/python3")
+    }
+
+    static var pythonEnvironment: [String: String] {
+        var environment = ProcessInfo.processInfo.environment
+        let openJDKHome = "/opt/homebrew/opt/openjdk@17/libexec/openjdk.jdk/Contents/Home"
+        if FileManager.default.fileExists(atPath: openJDKHome) {
+            environment["JAVA_HOME"] = openJDKHome
+            environment["PATH"] = "\(openJDKHome)/bin:" + (environment["PATH"] ?? "")
+        }
+        return environment
+    }
+
     static func run(
         inputURL: URL,
         outputURL: URL,
@@ -49,7 +71,8 @@ enum PDFTranslationRunner {
         appendLog("=== Translation started \(Date()) ===\nInput: \(inputURL.path)\nOutput: \(outputURL.path)\n", to: logURL)
 
         let process = Process()
-        process.executableURL = URL(fileURLWithPath: "/usr/bin/python3")
+        process.executableURL = pythonExecutableURL
+        process.environment = pythonEnvironment
         process.arguments = [
             scriptURL.path,
             inputURL.path,
